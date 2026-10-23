@@ -2,6 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"runtime/debug"
 
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -12,10 +16,11 @@ import (
 // UnlockSkill unlocks a named skill's MCPs — hosts call it to rebuild the unlock set
 // from history on a resumed session (design doc C2).
 type DeferredInfo struct {
-	Deferred    []string          // all MCP tool names (schema withheld)
-	GlobalNames []string          // MCP names to list in the system-prompt block
-	Unlock      *actool.UnlockSet // shared call-gate; nil when no MCP tools
-	UnlockSkill func(skillName string)
+	FindingGuidance string            // derived from the final permitted tools, including DB overrides
+	Deferred        []string          // all MCP tool names (schema withheld)
+	GlobalNames     []string          // MCP names to list in the system-prompt block
+	Unlock          *actool.UnlockSet // shared call-gate; nil when no MCP tools
+	UnlockSkill     func(skillName string)
 }
 
 // ToolAugment, if set, returns the EXTRA tools an agent should see beyond its
@@ -55,5 +60,28 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	if ToolResolve != nil {
 		out = ToolResolve(ctx, agentKey, out)
 	}
+	out, def.FindingGuidance = findingWorkflowTools(agentKey, out)
+	for i, t := range out {
+		out[i] = guardPanic(t)
+	}
 	return out, def, cleanup
+}
+
+// guardPanic turns a panicking tool handler into an ordinary tool error. The
+// harness runs each tool on its own goroutine, so a panic inside a handler can't
+// be recovered by the caller that started the run — it takes the whole process
+// down, and on restart the agent replays the same call and crashes again. Applied
+// last, so it covers every tool the agent can reach: domain, SDK, MCP and skill.
+func guardPanic(t actool.CoreTool) actool.CoreTool { return &guardedTool{CoreTool: t} }
+
+type guardedTool struct{ actool.CoreTool }
+
+func (g *guardedTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (res actool.Result, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[tools] %s panic: %v\n%s", g.Name(), r, debug.Stack())
+			res, err = actool.Errorf(fmt.Sprintf("工具 %s 内部错误：%v（本次调用已失败，可换个参数或改用别的工具）", g.Name(), r)), nil
+		}
+	}()
+	return g.CoreTool.Call(ctx, in, tc)
 }

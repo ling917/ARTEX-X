@@ -4,12 +4,65 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
 )
+
+// assetInterceptCandidates 提取一条待插入资产输入项的 域名/IP/URL 候选串，用于资产拦截匹配。
+// URL 的 host 会拆出归类，使「只带 URL」的服务/端点资产也能被 域名/IP 规则命中。
+func assetInterceptCandidates(item assetInputItem) (domains, ips, urls []string) {
+	add := func(dst *[]string, s string) {
+		if s = strings.TrimSpace(s); s != "" {
+			*dst = append(*dst, s)
+		}
+	}
+	add(&domains, item.Domain)
+	for _, d := range item.BoundDomains {
+		add(&domains, d)
+	}
+	add(&ips, item.IP)
+	add(&ips, item.ServiceIP)
+	add(&urls, item.URL)
+	if item.URL != "" {
+		if u, err := url.Parse(item.URL); err == nil {
+			if h := u.Hostname(); h != "" {
+				if net.ParseIP(h) != nil {
+					add(&ips, h)
+				} else {
+					add(&domains, h)
+				}
+			}
+		}
+	}
+	return domains, ips, urls
+}
+
+// assetInputLabel 返回一条待插入资产的简短标识，用于拦截说明消息。
+func assetInputLabel(item assetInputItem) string {
+	typ := strings.TrimSpace(item.Type)
+	var target string
+	switch {
+	case strings.TrimSpace(item.Domain) != "":
+		target = strings.TrimSpace(item.Domain)
+	case strings.TrimSpace(item.URL) != "":
+		target = strings.TrimSpace(item.URL)
+	case strings.TrimSpace(item.IP) != "":
+		target = strings.TrimSpace(item.IP)
+	case strings.TrimSpace(item.ServiceIP) != "":
+		target = strings.TrimSpace(item.ServiceIP)
+	default:
+		target = "(未知)"
+	}
+	if typ != "" {
+		return fmt.Sprintf("[%s] %s", typ, target)
+	}
+	return target
+}
 
 // =====================================================================
 // Unified asset insertion tools
@@ -63,29 +116,15 @@ type assetInputItem struct {
 	// ---- endpoint ----
 	Method string           `json:"method"`
 	Params []map[string]any `json:"params"`
-
-	// Related marks whether this asset is relevant to the CURRENT test task and
-	// should therefore auto-enter the coverage system (task_scope denominator).
-	// nil = default true (relevant → auto-scoped). false = insert into the shared
-	// asset库 but keep it OUT of this task's coverage. Only consulted when the task
-	// has the coverage feature enabled; ignored (no auto-scope either way) when off.
-	Related *bool `json:"related"`
 }
 
 // insertAssets is the unified insert_assets agent tool.
 func (t *ToolSet) insertAssets() actool.CoreTool {
 	return writeTool(
 		"insert_assets",
-		"发现新资产时立即批量插入资产到资产库。支持一次提交多种资产类型：root_domain/ip/subdomain/app/service/endpoint。\n"+
-			"每条资产的字段说明：\n"+
-			"• root_domain：domain(根域名, 必填)、icp(备案, 可选)\n"+
-			"• ip：ip(IP地址, 必填, 必须是 IPv4/IPv6 地址而非主机名)、bound_domains([域名])、open_ports([{port,service}])\n"+
-			"• subdomain：domain(子域名, 必填)、record_type(A/AAAA/CNAME等)、record_value(记录值)、icp(可选)\n"+
-			"• app：app_name(应用名, 必填)、bundle_id(bundle id, 可选)、category、description、app_icp、company_id(归属企业 id, 可选)\n"+
-			"• service(http)：url(必填)、technologies([指纹])、status_code、content_length、page_title、favicon_mmh3、auth([{type,username,password,...}])、service_ip\n"+
-			"• service(other)：service_name(必填)、ip或domain(至少一个)、port(必填)、auth([...])\n"+
-			"• endpoint：url(必填)、method(必填)、params([{location,name,value,type}])、service_ip\n"+
-			"auth/technologies/params 都是【追加合并】(append)，不会覆盖原有值。\n"+
+		"批量登记新发现的资产，一次可混合多种类型（type 见枚举）。\n"+
+			"各类型必填字段：root_domain→domain；ip→ip（须为 IPv4/IPv6，非主机名）；subdomain→domain；app→app_name；service(HTTP)→url；service(非HTTP)→service_name+port（ip/domain 至少填一个）；endpoint→url+method。其余字段含义见各自说明。\n"+
+			"auth/technologies/params 为追加合并(append)，不覆盖原值。\n"+
 			"返回：{results:[{index,id,type}], errors:[{index,error}]}",
 		obj(map[string]any{
 			// task_id 不暴露给模型：worker 归属哪个 task 由程序经 SetTaskID 权威赋值(见 handler)。
@@ -158,11 +197,6 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 						"description": "请求参数列表，每条含 location(query/body/header/path)/name/value/type（可选，追加不覆盖）",
 						"items":       map[string]any{"type": "object"},
 					},
-					// 覆盖度相关：该资产是否与当前测试任务有关。
-					"related": map[string]any{
-						"type":        "boolean",
-						"description": "该资产是否与【当前测试任务】相关：true(默认)才自动纳入资产覆盖度(测试范围分母)，该资产会进入待测资产中，如果是和任务无关的，例如CDN仅存储静态资源类，必须设置为false或不进行资产插入；false 则只入库、不计入本任务覆盖度(如顺带发现的旁站/无关资产)。仅在任务开启资产覆盖度功能时生效。",
-					},
 				}, "type"),
 			},
 		}, "assets"),
@@ -193,7 +227,28 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
+			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
+			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
+			blockRules, _ := t.as.ListAssetInterceptRules()
+			var allowRules []db.AssetInterceptRule
+			if t.taskID > 0 {
+				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
+					blockRules = append(blockRules, tb...)
+					allowRules = ta
+				}
+			}
+
 			for i, item := range a.Assets {
+				// 资产闸门：先拦截后允许，被拒的资产禁止插入（跳过 Upsert 及后续副作用）。
+				domains, ips, urls := assetInterceptCandidates(item)
+				if d := db.EvaluateAssetGate(blockRules, allowRules, domains, ips, urls); !d.Allowed {
+					errs = append(errs, errEntry{
+						Index: i,
+						Error: fmt.Sprintf("资产 %s %s，已禁止插入", assetInputLabel(item), d.Reason),
+					})
+					continue
+				}
+
 				typ := strings.TrimSpace(item.Type)
 				var id int64
 				var err error
@@ -299,10 +354,9 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 				}
 				// 自动入测试范围(source='auto')：只对 worker 顶层显式插入的这一项，按其
 				// 类型加保守范围；side-effect 派生的资产不经此处，故范围不盲目扩大。taskID=0 时无操作。
-				// 资产覆盖度功能关闭时不再累积测试范围(分母)；related=false(与当前任务无关)
-				// 的资产也只入库、不计入覆盖度。related 省略/null 视为 true(默认纳入)。
-				related := item.Related == nil || *item.Related
-				if !t.coverageDisabled && related {
+				// 与覆盖度开关无关：task_scope 是任务的范围边界(list/查询的过滤基准)，
+				// 覆盖度开关只决定要不要把它当分母去算指标，不决定要不要累积范围本身。
+				{
 					svcIP := item.ServiceIP
 					if svcIP == "" {
 						svcIP = item.IP
@@ -377,7 +431,7 @@ func (t *ToolSet) addCompanyScope() actool.CoreTool {
 func (t *ToolSet) addTaskScope() actool.CoreTool {
 	return writeTool(
 		"add_task_scope",
-		"把测试范围加入【本任务】——这是资产测试覆盖度的分母，也是本任务的授权边界。\n"+
+		"把测试范围加入【本任务】——这是本任务的授权边界，也是资产测试覆盖度的分母。\n"+
 			"kind 支持：company(整个公司名下资产) / root_domain(整个根域，含所有子域) / subdomain(单个精确子域) / ip / cidr / icp / keyword。\n"+
 			"说明：worker 逐个碰到的主机会被系统【自动】加进范围(精确子域)；本工具用于【主动扩大】——把整个根域/整个公司纳入，或补充指定某子域/IP。\n"+
 			"value：company 传公司名或 id(公司须已存在)；root_domain/subdomain 传域名；ip/cidr 传 IP 或网段；icp/keyword 传备案号或企业关键词。\n"+
@@ -476,34 +530,13 @@ func (t *ToolSet) listUntestedAssets() actool.CoreTool {
 func (t *ToolSet) listAssets() actool.CoreTool {
 	return readTool(
 		"list_assets",
-		"查询资产库。支持 DSL 表达式搜索、按 id/ids 直接取，分页。\n"+
-			"DSL 语法：field=value 模糊(ILIKE) | field==value 精确 | field!=value 排除 | port>80 数字比较 | 裸词=全文模糊。\n"+
-			"逻辑运算：AND / OR（关键字，AND 优先级高于 OR），括号分组。\n"+
-			"资产类型用独立的 type 参数过滤，DSL 里不含 type 字段。\n"+
-			"约束：未传 id/ids 时 dsl 必须非空——不允许无条件查询全部资产，必须带查询条件。\n"+
-			"字段一览：\n"+
-			"  domain      域名（根域名/子域名/服务域名）\n"+
-			"  root_domain 根域名（仅子域名/服务资产有）\n"+
-			"  ip          IPv4/IPv6 地址\n"+
-			"  url         完整 URL（服务/接口）\n"+
-			"  page_title  页面标题（HTTP 服务）\n"+
-			"  icp         ICP 备案号（根域名）\n"+
-			"  service_name 服务名称（非 HTTP 服务）\n"+
-			"  app_name    应用名称（app 类型）\n"+
-			"  method      HTTP 方法（接口类型，如 GET/POST）\n"+
-			"  service_type HTTP 服务类型：http|other\n"+
-			"  record_type DNS 解析类型（子域名，如 A/CNAME）\n"+
-			"  technology  指纹/技术栈（数组字段，= 模糊 == 精确）\n"+
-			"  port        端口号（整数，支持 > >= < <=）\n"+
-			"  status_code HTTP 状态码（整数，支持 > >= < <=）\n"+
-			"  company_id  归属企业 id（整数）\n"+
-			"  task_id     来源任务 id（整数）\n"+
-			"示例：status_code>=400 AND technology=shiro\n"+
-			"      method==POST AND url=/api/admin\n"+
-			"      icp=京 OR icp=沪\n"+
-			"      (port==80 OR port==443) AND technology=nginx",
+		"查询资产库：DSL 表达式搜索，或按 id/ids 直取；支持分页。只返回【本任务及直接关联任务】测试范围内的资产。\n"+
+			"DSL：field=value 模糊(ILIKE) | field==value 精确 | field!=value 排除 | 数字字段支持 > >= < <= | 裸词=全文模糊；AND/OR 组合(AND 优先级高)，可用括号分组。资产类型用独立 type 参数，不写进 DSL。\n"+
+			"未传 id/ids 时 dsl 必须非空（不允许无条件全量查询）。\n"+
+			"可用字段：domain(根/子/服务域名)、root_domain、ip、url、page_title、icp、service_name、app_name、method(如 GET/POST)、service_type(http|other)、record_type(如 A/CNAME)、technology(数组，=模糊 ==精确)、port/status_code/company_id(整数)。\n"+
+			"示例：status_code>=400 AND technology=shiro ；(port==80 OR port==443) AND technology=nginx",
 		obj(map[string]any{
-			"dsl":    str(`DSL 查询表达式，参见工具描述。未传 id/ids 时必须非空。例：status_code>=400 technology=shiro / method==POST url=/api/admin`),
+			"dsl":    str(`DSL 查询表达式（语法/字段见工具描述）。未传 id/ids 时必须非空。`),
 			"type":   str("资产类型过滤：root_domain|ip|subdomain|app|service|endpoint（独立字段，可与 dsl 叠加；单独 type 不足以查询，仍需 dsl）"),
 			"id":     intp("直接按单个资产 id 取（可选，与 dsl/type 互斥）"),
 			"ids":    map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "直接按多个资产 id 取（可选，与 dsl/type 互斥）"},
@@ -531,11 +564,11 @@ func (t *ToolSet) listAssets() actool.CoreTool {
 			var err error
 			switch {
 			case a.ID > 0:
-				assets, err = t.as.GetByIDs([]int64{a.ID})
+				assets, err = t.as.GetByIDsInScope(t.taskID, []int64{a.ID})
 			case len(a.IDs) > 0:
-				assets, err = t.as.GetByIDs(a.IDs)
+				assets, err = t.as.GetByIDsInScope(t.taskID, a.IDs)
 			case a.DSL != "":
-				assets, err = t.as.QueryDSL(a.DSL, a.Type, a.Limit, a.Offset)
+				assets, err = t.as.QueryDSLInScope(a.DSL, a.Type, t.taskID, a.Limit, a.Offset)
 			default:
 				return actool.Errorf("未传 id/ids 时 dsl 不能为空：不允许无条件查询全部资产，请提供查询条件"), nil
 			}
@@ -610,13 +643,20 @@ func splitLines(s string) []string {
 // WorkerTools returns the tool set for a work agent.
 func (t *ToolSet) WorkerTools() []actool.CoreTool {
 	return []actool.CoreTool{
-		t.listFindings(), t.listFacts(), t.nodeDetail(),
+		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
+		t.listFindings(),
 		t.addFinding(), t.recordFact(),
-		// cross-work retrieval
-		t.searchAllWorkerTraces(), t.listWorkerTraces(), t.getWorkerTrace(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
-		t.insertAssets(), t.listAssets(), t.listCompanies(),
+		t.insertAssets(), t.listAssets(),
+		// 跨 work 回看：worker 也可复用其他 work 的观察，避免重复劳动。
+		// search_all_worker_traces：不必先知道 intent_id，按关键字全局捞命中步骤；
+		// get_worker_trace：锁定某条 work 后列步骤/就地搜/取完整内容。
+		t.searchAllWorkerTraces(), t.getWorkerTrace(),
+		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
+		t.nodeDetail(),
+		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
+		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}
 }
 
@@ -624,6 +664,7 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 func (t *ToolSet) MainAgentTools() []actool.CoreTool {
 	return []actool.CoreTool{
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
+		t.expandDigest(), // cold-digest §6.1
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.addHint(), t.addIntent(),
 		// steer_work：人可对某条正在运行的意图(work)实时注入纠偏指令（不打断、不丢进展）。
 		t.steerWorkTool(),

@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/memory"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
@@ -27,31 +27,42 @@ import (
 // goal on its own. Multiple workers run concurrently as goroutines.
 // WebSearchOpts is the web-search backend selection the server pushes into each
 // agent (planner/worker/main). Enabled=false leaves the web_search tool off.
-// Backend is "ddgs" (no key), "brave-free" (BraveKey required), or "tavily"
-// (TavilyKey required). It maps directly onto agentcore.Options.
+// Backend is "ddgs" (no key), "brave-free" (BraveKey required), "tavily"
+// (TavilyKey required), or "deepseek" (DeepSeek* required, filled from the
+// active LLM profile). It maps directly onto agentcore.Options.
 // Proxy is a dedicated egress proxy for the search request (http/https/socks5),
 // independent of the traffic-recording MITM proxy — set it when the search endpoint
 // is only reachable via a VPN/SOCKS proxy. Empty = direct.
+//
+// 注意 deepseek 后端与其它三个的性质不同：DeepSeek 没有可直接调用的搜索接口，
+// 搜索只存在于其 Anthropic 兼容 messages 接口内部(web_search_20250305 server
+// tool)，因此每次搜索会消耗一次模型调用，且搜索请求由 DeepSeek 服务端发出——
+// 不经过本机 Proxy，也不会进流量留痕。
 type WebSearchOpts struct {
 	Enabled   bool
 	Backend   string
 	BraveKey  string
 	TavilyKey string
 	Proxy     string
+	// DeepSeek* 来自当前激活的 LLM 配置(仅 anthropic 格式的 DeepSeek 官方端点)，
+	// 不单独配置，随 LLM 配置切换而变。
+	DeepSeekBaseURL string
+	DeepSeekAPIKey  string
+	DeepSeekModel   string
 }
 
 type Worker struct {
-	prov        llm.Provider
-	model       string
-	workDir     string
-	proxyAddr   string
-	proxyCACert string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
-	webSearch   WebSearchOpts     // web_search tool backend selection (off by default)
-	mem         *memory.Store     // cross-engagement tradecraft memory (G4)
-	tx          *transcript.Store // raw LLM conversation persistence (nil = off)
-	window      int               // context window in tokens (for compaction)
-	windowFn    func() int        // optional dynamic task-chain minimum
-	maxTurns    int               // max agent turns per run (0 = unlimited)
+	findingRecorder FindingRecorder
+	prov            llm.Provider
+	model           string
+	workDir         string
+	proxyAddr       string
+	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
+	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
+	window          int               // context window in tokens (for compaction)
+	windowFn        func() int        // optional dynamic task-chain minimum
+	maxTurns        int               // max agent turns per run (0 = unlimited)
 	// runTimeout is the wall-clock budget for the main exploration of one intent
 	// (0 = unlimited). When it fires, the run is cut and a settlement round is
 	// forced so already-identified facts get written back instead of being lost.
@@ -67,6 +78,10 @@ type Worker struct {
 	// path. Read per run so a profile/task toggle takes effect without rebuilding
 	// the agent. nil = streaming (default).
 	nonStreamingFn func() bool
+	// noaEnabledFn resolves whether this run uses the experimental noa context-
+	// compression mechanism. Read per run, like nonStreaming. nil = off (built-in
+	// compaction).
+	noaEnabledFn func() bool
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
@@ -103,6 +118,11 @@ func (w *Worker) SetNonStreaming(fn func() bool) { w.nonStreamingFn = fn }
 
 func (w *Worker) nonStreaming() bool { return w.nonStreamingFn != nil && w.nonStreamingFn() }
 
+// SetNoaEnabled wires a resolver deciding whether runs use the experimental noa
+// context-compression mechanism. nil/unset = off (built-in compaction). Read per
+// run so the settings toggle takes effect without rebuilding the agent.
+func (w *Worker) SetNoaEnabled(fn func() bool) { w.noaEnabledFn = fn }
+
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
 // send no cap and let the endpoint decide. Read per run, like nonStreaming.
 func (w *Worker) SetMaxTokens(fn func() int) { w.maxTokensFn = fn }
@@ -128,22 +148,30 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 	w.runTimeout = run
 }
 
-// settleHardGrace is how far past the soft wall-clock budget (runTimeout) the hard
-// ctx deadline sits — a backstop for a hung turn; the soft budget handles the
-// normal case at the turn boundary.
-const settleHardGrace = 90 * time.Second
-
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
 const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
 
-// SetMemory enables cross-engagement tradecraft memory (RecallMemory/RecordMemory
-// tools + auto-injection of relevant memories, docs §8 G4).
-func (w *Worker) SetMemory(m *memory.Store) { w.mem = m }
-
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
+}
+
+// defaultToolsExcept returns actool.DefaultTools() minus the named tools (by
+// CoreTool.Name()). Used to trim SDK default tools an agent shouldn't have.
+func defaultToolsExcept(exclude ...string) []actool.CoreTool {
+	drop := make(map[string]bool, len(exclude))
+	for _, n := range exclude {
+		drop[n] = true
+	}
+	all := actool.DefaultTools()
+	out := make([]actool.CoreTool, 0, len(all))
+	for _, t := range all {
+		if !drop[t.Name()] {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (w *Worker) SetCompactionWindowResolver(fn func() int) { w.windowFn = fn }
@@ -199,21 +227,20 @@ func proxyEnv(proxyAddr, caCert string) []string {
 // prompt, seeded into agent_prompts. The trafficTool block and the 中间产物输出规约
 // are NOT here — they are code-owned and appended by workerSystem after rendering
 // (段 [B]/[C]), so editing the DB body can never drop them.
-const workerDefaultTmpl = `你是一个 ARTEX 平台授权渗透测试系统的"执行者"(work agent)。你领到【一条意图】(一句话探索方向)，唯一职责：**完成这一条意图、把发现写回知识图谱、然后停止返回。**
+const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系统的"执行者"(work agent)。你领到【一条意图】(一句话探索方向)，唯一职责：**完成这一条意图、把发现写回知识图谱、然后停止返回。**
 
 **边界（红线）**：
-1. **只做这一条意图**。意图边界就是红线：指纹意图只做指纹，不顺手枚举端点、爆破目录、扒 JS 找 API、测漏洞——那些是别的意图，由规划者派别的 worker。你也不负责生成探索方向。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**（它会在 recent_facts 概览里看到并规划），别自己接着追。
-2. **穷尽这条意图内的手段再下结论**。初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——换编码/方法/参数/路径把本意图的合理手段走完再判定；但穷尽只限【本意图内部】，绝不外扩去做别的意图。真正探透、或合理手段已走完后立即写回并返回；别因"总目标未达成"继续，也别为凑步数在已探尽的方向空转。
+1. **只做你领到的这一条意图**。**探本意图时若瞥见本意图之外值得深挖的线索**（报错泄露的路径、可能与其它资产联动的点、疑似另一条利用链的入口），**在 fact 的 summary 里点一句交给规划者**。
+2. 初次受阻（payload 被过滤 / 404 / 注入无回显）不代表已探透——把本意图的所有绕过手段走完再输出结论；
 3. 只在授权范围内操作。系统提示顶部若附【操作约束】，那是最高优先级红线：每条命令/探测执行前先自检，违反即不做（哪怕它落在你领到的意图里）。
 
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
-- **新资产/资源 → insert_assets（资产图）**：endpoint / parameter / tech 指纹 / service / 凭据 / 子域 等。你只传原始信息，key 与父子关联由代码算：新接口传完整 url+method（代码自动建 domain→site→endpoint、抽 URL query 参数，body/header 参数放 params）；指纹传 type=tech,name=技术名,on_url=站点地址,props={version,category}。结构化属性写在资产自己的 props 上（状态码/标题/body 长/content_type 放 props.http），探索结论不写这里。多资产用 assets 数组一次批量登记。
+- **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
 - **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
-**查上下文（按需）**：list_assets / asset_neighbors / list_facts（探索事实，分页最新在前，默认 20，可 q 过滤、before 翻页）/ list_findings / node_detail（探索节点 id，非资产 id）。
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。务实、克制、聚焦这一条意图。`
+完成本意图后用一句话总结你做了什么、写回了哪些事实。`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -262,6 +289,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
+	// Optional finding guidance is added for every role after tool resolution.
 	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
 }
 
@@ -303,9 +331,9 @@ func renderWorkerGraphOverview(data map[string]any) string {
 	if err != nil {
 		return "" // fall back silently: the worker just won't have the global context
 	}
-	return "\n\n【全局探索态势（仅供你了解大局，不是你的任务清单）】：\n" +
-		"下面是整个任务当前的探索概况。给你的**唯一目的**是让你了解全局动态。\n" +
-		"**它绝不扩大你的职责边界**：你仍然只做上面领到的那一条意图。看到这里有别的 open 意图 / 未覆盖的点 / 其它可打方向，也**绝不要自己去动手**——那些是别的 worker 的事，由规划者调度。你若发现相关新线索，最多写进 fact 让规划者知道，不要自己追。\n" +
+	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
+		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
+		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
 		string(b)
 }
 
@@ -332,6 +360,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
+	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
@@ -345,10 +374,11 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// then augment with the agent's visible skills/MCP. During the SDK settlement
 	// phase, Bash is hidden via Settlement.DisabledTools (no local gating needed).
 	base := append(tsx.WorkerTools(), w.extraTools...)
-	base = append(base, actool.DefaultTools()...)
+	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
+	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
+	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
-	tools = tsx.StripCoverageParams(tools) // 覆盖度关闭时隐藏 insert_assets 的 related 入参
 	defer cleanup()
 
 	// 意图是 worker 的【唯一职责、贯穿整个 run 的不变量】→ 连同启动指令、意图锚定的目标资产
@@ -359,6 +389,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	// The run-wide intent is not the current tool action. Do not forward it or
+	// inherit a parent run's background into the action reviewer.
+	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
 	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
 	sysBody := workerSystem(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	if w.wantConstraints() {
@@ -408,11 +441,14 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		WebFetchCACert: w.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立的出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
-		EnableWebSearch:    w.webSearch.Enabled,
-		WebSearchBackend:   w.webSearch.Backend,
-		BraveSearchAPIKey:  w.webSearch.BraveKey,
-		TavilySearchAPIKey: w.webSearch.TavilyKey,
-		WebSearchProxy:     w.webSearch.Proxy,
+		EnableWebSearch:       w.webSearch.Enabled,
+		WebSearchBackend:      w.webSearch.Backend,
+		BraveSearchAPIKey:     w.webSearch.BraveKey,
+		TavilySearchAPIKey:    w.webSearch.TavilyKey,
+		DeepSeekSearchBaseURL: w.webSearch.DeepSeekBaseURL,
+		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
+		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
+		WebSearchProxy:        w.webSearch.Proxy,
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
 		BashEnv:    proxyEnv(w.proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
@@ -435,9 +471,6 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
-	if w.mem != nil {
-		opts.Memory = &agentcore.MemoryOptions{Store: w.mem, AutoInject: true, MaxInject: 3}
-	}
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
 		opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)
@@ -457,6 +490,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		input = "开始执行 system 里领到的意图：只做它、只产生事实、assets、finding、做完即停。"
 	}
 
+	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
+	noaSession := WorkerSessionID(ts.ID(), intent.ID)
+	enableNoa(&opts, w.noaEnabledFn, w.workDir, noaSession, noaWarn(noaSession))
+	ctx = attachSideCapture(ctx, &opts)
 	s := agentcore.NewSession(opts)
 	defer s.Close() // release the session's background-task manager (temp dir + processes)
 
@@ -489,18 +526,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 
 	// Budgets + settlement are owned by the SDK (MaxTurns/MaxDuration + Settlement):
 	// on hit it runs a wrap-up turn and finishes with ReasonMaxTurns/ReasonTimeout.
-	// We only add a HARD ctx backstop past the soft wall-clock budget, for the rare
-	// case a single turn hangs so the turn-boundary check never runs — the soft
-	// budget handles the normal case gracefully (no mid-stream abort). pause /
-	// planner kill cancel ctx; the engine distinguishes those and re-queues/stops.
-	// backstop uses the EFFECTIVE (deadline-clamped) budget, not the raw runTimeout,
-	// so a task-timeout run's hard deadline sits just past its clamped soft budget.
-	runCtx := ctx
-	if maxDur > 0 {
-		var runCancel context.CancelFunc
-		runCtx, runCancel = context.WithTimeoutCause(ctx, maxDur+settleHardGrace, AbortRunHardTimeout)
-		defer runCancel()
-	}
-	_, reason, err := captureRunSession(runCtx, s, input, emitWrap)
+	// MaxDuration now interrupts an in-flight tool at the wall-clock deadline and
+	// enters the wrap-up phase on the live ctx, so a run whose tool overran the budget
+	// still settles (no external hard-timeout backstop needed). ctx itself carries only
+	// pause / planner kill / shutdown, which the engine distinguishes and re-queues/stops.
+	_, reason, err := captureRunSession(ctx, s, input, emitWrap)
 	return reason, tsx.Writes(), err
 }

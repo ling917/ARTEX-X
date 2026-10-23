@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/Autumn-27/artex/db"
@@ -10,6 +11,7 @@ import (
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
+	"github.com/Autumn-27/norma/transcript"
 )
 
 // goalsDefaultTmpl is the built-in EDITABLE body (段 [A]) of the goals-decomposer
@@ -51,7 +53,7 @@ const goalsDefaultTmpl = `你是渗透测试目标分解器。你的职责是从
 const goalsScopeTail = `
 
 **额外职责：登记测试资产范围**
-除拆分目标外，你还要从「任务目标 / 任务描述」里识别出**明确给出的测试资产范围**，调用 add_task_scope 登记（资产测试覆盖度的分母，也是授权边界）。**最小范围原则：只登记用户明确点到的那一个目标，绝不擅自放大。**
+除拆分目标外，你还要从「任务目标 / 任务描述」里识别出**明确给出的测试资产范围**，调用 add_task_scope 登记（本任务的授权边界，也是资产测试覆盖度的分母）。**最小范围原则：只登记用户明确点到的那一个目标，绝不擅自放大。**
 - 目标是 URL 或带主机名的地址（如 https://xxx.example.com/path、app.example.com）→ 取其**完整主机名**，kind=subdomain，value=完整主机名。
   例：目标 https://a1b2c3.lab.example.net/path → kind=subdomain，value=a1b2c3.lab.example.net（**不是** example.net）。
   **严禁**把带子域的主机名缩成根域名——看到 xxx.example.com 就登记整个 example.com 会把范围扩到用户目标之外，违背最小范围原则。
@@ -108,6 +110,15 @@ func DecomposeGoals(ctx context.Context, prov llm.Provider, dataDir, goalText, d
 func DecomposeGoalsWithProvider(ctx context.Context, prov llm.Provider, dataDir, goalText, desc string, as *db.AssetStore, ts *db.ExplorationStore, taskID int64, nonStreaming bool, maxTokens int, emit func(db.Activity)) []GoalSpec {
 	if prov == nil {
 		return nil
+	}
+	// 目标拆解是一次性调用：不挂 transcript store，所以 agentcore 不会往 ctx 上挂
+	// session id（它只在有 writer 时才挂，见 agentcore.Prompt）。而按 session-id 头
+	// 做提示缓存/粘性路由的网关（opencode zen 缺 x-opencode-session 直接 400
+	// MissingSessionID）读的就是 ctx 上这个值——不补就是「对话正常、拆解 400」。
+	// 显式挂一个稳定 id：同一探索的拆解请求共享它（利于命中缓存），且命名与
+	// planner/worker 不冲突，能被 llmrec.parseSession 正确归因。
+	if ts != nil {
+		ctx = transcript.WithSessionID(ctx, fmt.Sprintf("exp%d-goals", ts.ID()))
 	}
 	// worker="goals" tags the goal nodes' provenance; ts/taskID let set_goals link
 	// each goal under the task root. This is the catalog's real set_goals tool, so a
