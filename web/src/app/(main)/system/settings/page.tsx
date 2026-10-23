@@ -2,7 +2,7 @@
 
 import * as React from "react";
 
-import { CpuIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -15,8 +15,11 @@ import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
 import type { Settings } from "@/lib/types";
 
+import { UpdateCard } from "./_components/update-card";
+
 export default function SystemSettingsPage() {
   const [trafficCapture, setTrafficCapture] = React.useState(false);
+  const [agentTrafficBinding, setAgentTrafficBinding] = React.useState(false);
   const [webSearch, setWebSearch] = React.useState(false);
   const [backend, setBackend] = React.useState("ddgs");
   const [braveKeySet, setBraveKeySet] = React.useState(false);
@@ -38,21 +41,25 @@ export default function SystemSettingsPage() {
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
+  // 实验功能:noa 上下文压缩(默认关)。
+  const [noaCompaction, setNoaCompaction] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
   const sendMode = useChatSendMode();
 
   const apply = React.useCallback((s: Settings) => {
     setTrafficCapture(!!s.traffic_capture);
+    setAgentTrafficBinding(!!s.agent_traffic_binding);
     setWebSearch(!!s.web_search_enabled);
     setBackend(s.web_search_backend || "ddgs");
     setBraveKeySet(!!s.brave_key_set);
     setTavilyKeySet(!!s.tavily_key_set);
-    setProxyInput(s.web_search_proxy || "");
-    setGlobalProxyInput(s.global_proxy || "");
-    setPyInterp(s.python_interpreter || "");
+    setProxyInput(s.web_search_proxy ?? "");
+    setGlobalProxyInput(s.global_proxy ?? "");
+    setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
+    setNoaCompaction(!!s.noa_compaction);
   }, []);
 
   const saveWorkers = () => {
@@ -118,12 +125,42 @@ export default function SystemSettingsPage() {
       .catch(() => setInjectPlanner(!v)); // revert on failure
   };
 
+  const toggleAgentTrafficBinding = (v: boolean) => {
+    setAgentTrafficBinding(v);
+    setSaving(true);
+    api
+      .setSettings({ agent_traffic_binding: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启 Agent 自动绑定流量" : "已关闭 Agent 自动绑定流量");
+      })
+      .catch((e) => {
+        setAgentTrafficBinding(!v);
+        toast.error(`保存失败：${(e as Error).message}`);
+      })
+      .finally(() => setSaving(false));
+  };
+
   const toggleInjectWorker = (v: boolean) => {
     setInjectWorker(v); // optimistic
     api
       .setSettings({ constraints_inject_worker: v })
       .then(apply)
       .catch(() => setInjectWorker(!v)); // revert on failure
+  };
+
+  const toggleNoaCompaction = (v: boolean) => {
+    setNoaCompaction(v); // optimistic
+    api
+      .setSettings({ noa_compaction: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启 noa 上下文压缩（对之后启动的运行生效）" : "已关闭 noa 上下文压缩（恢复内置压缩）");
+      })
+      .catch((e) => {
+        setNoaCompaction(!v); // revert on failure
+        toast.error(`保存失败：${(e as Error).message}`);
+      });
   };
 
   // Persist a web-search patch (enable and/or backend). Optimistic with refetch.
@@ -229,6 +266,8 @@ export default function SystemSettingsPage() {
           多列则自动按内容高度平衡填充。卡片间距靠 mb 而非 gap——多列布局下
           column-gap 只管列间距，行间距要由子元素自己给。 */}
       <div className="columns-1 gap-4 md:gap-6 lg:columns-2">
+        <UpdateCard />
+
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
@@ -260,6 +299,34 @@ export default function SystemSettingsPage() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
               <RadioTowerIcon className="size-4" />
+              Agent 自动绑定流量
+            </CardTitle>
+            <CardDescription id="agent-traffic-binding-description">
+              默认关闭。开启后，漏洞入库时触发的报告 Agent 会核对已有 HTTP 请求/响应，关联对应流量后再编写报告。
+              <b>查阅数据包及额外的工具调用会增加 Token 消耗。</b>
+              <br />
+              TCP、未抓包或没有匹配流量时仍可正常上报。此开关不影响流量捕获、人工绑定及已保存证据的查看。 对下一轮 Agent
+              生效；关闭后会立即拒绝新的自动绑定。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="agent-traffic-binding" className="text-sm font-normal text-muted-foreground">
+              {agentTrafficBinding ? "已开启 · 会增加 Token 消耗" : "已关闭 · 可继续人工绑定"}
+            </Label>
+            <Switch
+              id="agent-traffic-binding"
+              aria-describedby="agent-traffic-binding-description"
+              checked={agentTrafficBinding}
+              disabled={!loaded || saving}
+              onCheckedChange={toggleAgentTrafficBinding}
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <RadioTowerIcon className="size-4" />
               全局代理
             </CardTitle>
             <CardDescription>
@@ -269,8 +336,9 @@ export default function SystemSettingsPage() {
               开启<b>流量捕获</b>时，它作为记录代理的<b>上游</b>（流量仍全量落库，再经此代理出网）；关闭捕获时，直接注入
               Agent 的 bash / WebFetch 出网。与网络搜索代理、LLM 代理相互独立。
               <br />
-              <b>提示</b>：socks5 在<b>关闭捕获</b>时依赖各命令行工具对 <code>ALL_PROXY</code> 的支持（curl 可用，部分工具可能忽略）；
-              若主要用 socks5，建议开启流量捕获——此路径由 MITM 亲自拨号，工具无感知、稳定生效。
+              <b>提示</b>：socks5 在<b>关闭捕获</b>时依赖各命令行工具对 <code>ALL_PROXY</code> 的支持（curl
+              可用，部分工具可能忽略）； 若主要用 socks5，建议开启流量捕获——此路径由 MITM
+              亲自拨号，工具无感知、稳定生效。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
@@ -291,9 +359,7 @@ export default function SystemSettingsPage() {
               </Button>
             </div>
             <p className="text-muted-foreground text-xs">
-              {globalProxyInput.trim()
-                ? "已配置 · 所有目标流量经此代理出网"
-                : "未配置 · 目标流量直连出网"}
+              {globalProxyInput.trim() ? "已配置 · 所有目标流量经此代理出网" : "未配置 · 目标流量直连出网"}
             </p>
           </CardContent>
         </Card>
@@ -308,8 +374,8 @@ export default function SystemSettingsPage() {
               开启后，把每个任务的<b>操作约束</b>（在任务总览「操作约束」里维护的 allow/deny 条目）拼进对应 Agent
               的系统提示，用来框定探索边界（如「仅测当前端口」「禁止爆破」）。
               <br />
-              可分别控制注入到 <b>规划者（planner）</b>与 <b>执行者（worker）</b>；默认都开。切换即时生效（下一轮读取），无需重建
-              Agent。关闭后该 Agent 不再看到约束。
+              可分别控制注入到 <b>规划者（planner）</b>与 <b>执行者（worker）</b>
+              ；默认都开。切换即时生效（下一轮读取），无需重建 Agent。关闭后该 Agent 不再看到约束。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -341,6 +407,34 @@ export default function SystemSettingsPage() {
         <Card className="mb-4 break-inside-avoid md:mb-6">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-base">
+              <FlaskConicalIcon className="size-4" />
+              实验功能
+            </CardTitle>
+            <CardDescription>
+              尚在验证中的机制，默认关闭。可能改变 Agent 行为或影响稳定性，请在了解影响后启用。
+              <br />
+              <b>noa 上下文压缩</b>：由模型主动压缩长对话历史（norma v0.4.0）。开启后平台接入的四类 Agent（
+              <b>规划者 / 执行者 / 主 Agent / 对话</b>）改用 noa 接管上下文，取代内置压缩，
+              压缩原文会归档到任务工作目录下便于回溯。切换即时生效（对之后启动的运行生效），无需重建 Agent；
+              关闭后立即恢复内置压缩。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex items-center justify-between gap-4">
+            <Label htmlFor="noa-compaction" className="text-sm font-normal text-muted-foreground">
+              noa 上下文压缩{noaCompaction ? " · 已开启" : " · 已关闭"}
+            </Label>
+            <Switch
+              id="noa-compaction"
+              checked={noaCompaction}
+              disabled={!loaded}
+              onCheckedChange={toggleNoaCompaction}
+            />
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
               <SearchIcon className="size-4" />
               网络搜索
             </CardTitle>
@@ -349,8 +443,9 @@ export default function SystemSettingsPage() {
               <b>web_search</b>（仅返回标题/链接/摘要，不抓取正文；抓取由 WebFetch 负责）。网络搜索<b>不走</b>
               记录代理，独立于流量捕获。
               <br />
-              来源可选 <b>DuckDuckGo（ddgs）</b>（无需 Key）、<b>Brave（免费版）</b>（需填写 Brave API Key）或{" "}
-              <b>Tavily</b>（需填写 Tavily API Key）。总开关关闭时，各 Agent 的网络搜索开关不可用。
+              来源可选 <b>DuckDuckGo（ddgs）</b>（无需 Key）、<b>Brave（免费版）</b>（需填写 Brave API Key）、{" "}
+              <b>Tavily</b>（需填写 Tavily API Key）或 <b>DeepSeek</b>（复用当前 LLM 配置）。总开关关闭时，各
+              Agent 的网络搜索开关不可用。
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
@@ -387,8 +482,28 @@ export default function SystemSettingsPage() {
                     <SelectItem value="ddgs">DuckDuckGo（ddgs · 免费无 Key）</SelectItem>
                     <SelectItem value="brave-free">Brave（免费版 · 需 Key）</SelectItem>
                     <SelectItem value="tavily">Tavily（需 Key）</SelectItem>
+                    <SelectItem value="deepseek">DeepSeek（官方）</SelectItem>
                   </SelectContent>
                 </Select>
+              </div>
+            )}
+
+            {webSearch && backend === "deepseek" && (
+              <div className="border-border/60 bg-muted/30 flex flex-col gap-2 rounded-md border p-3">
+                <p className="text-sm font-medium">DeepSeek 官方联网搜索</p>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  该来源直接复用<b>当前激活的 LLM 配置</b>。因此它
+                  <b>仅支持 DeepSeek 官方模型</b>，且该配置<b>必须使用 anthropic 协议</b>
+                  ——DeepSeek 的 OpenAI 协议端点不支持服务端搜索。切换 LLM 配置后此来源可能失效。
+                </p>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  与其它来源不同，搜索由 <b>DeepSeek 服务端执行</b>：每次搜索会额外消耗一次模型调用（产生 Token
+                  费用），搜索请求<b>不经过上面的出口代理</b>，也<b>不计入流量留痕</b>；返回结果<b>只有标题和链接</b>
+                  （无摘要），需要正文时由 WebFetch 抓取。
+                </p>
+                <p className="text-muted-foreground text-xs leading-relaxed">
+                  是否满足上述条件由你自行确认，系统不做拦截；可用下方「测试搜索」按钮实际跑一次来验证。
+                </p>
               </div>
             )}
 

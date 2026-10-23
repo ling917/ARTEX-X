@@ -3,15 +3,19 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import type {
+  ActiveFindingRetest,
   Activity,
   Agent,
   AgentDetail,
   AgentTrigger,
   ArchiveBatchItem,
   Asset,
+  AssetInterceptRule,
+  AssetInterceptRuleInput,
   Audit,
   BatchCategoryItem,
   BatchControlItem,
@@ -28,28 +32,43 @@ import type {
   DeleteTaskOptions,
   DeleteTaskResult,
   Edge,
+  EvidenceBodyPreview,
+  ExplorationNodePage,
+  ExplorationNodeQuery,
   Finding,
   FindingAssetTree,
   FindingDeepenResponse,
   FindingGroupsPage,
   FindingQuery,
+  FindingRetest,
   FindingStats,
   FindingStatus,
   FindingsPage,
+  FindingTraffic,
+  FindingTrafficDetail,
   IntentAsset,
+  InterceptApprovalFilter,
   InterceptApprovalRow,
+  InterceptDetail,
   InterceptPending,
   InterceptRule,
   JudgeConfig,
+  JudgeUsage,
   LLMPoolStatus,
   LLMProfile,
   LLMRecordDetail,
   LLMRecordItem,
+  LLMRetryOverride,
+  LLMRetryPolicy,
   LLMTask,
   MCPServer,
   MCPTool,
   MissingSkill,
   ModelTokenStat,
+  NotificationChannel,
+  NotificationDelivery,
+  NotificationFilter,
+  NotificationMeta,
   PromptVar,
   PromptVersion,
   SessionTokenUsage,
@@ -77,9 +96,20 @@ import type {
   Tool,
   ToolStat,
   TrafficDetail,
+  TrafficEvidenceRef,
+  TrafficEvidenceRole,
   TrafficHost,
   TrafficResp,
+  UpdateCheck,
   UsageStats,
+  WebShell,
+  WebShellDetail,
+  WebShellExecResult,
+  WebShellFileData,
+  WebShellFileListing,
+  WebShellInfo,
+  WebShellInput,
+  WebShellTestResult,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -89,7 +119,7 @@ function getToken(): string | null {
   return localStorage.getItem("artex_token");
 }
 
-async function http<T>(path: string, init?: RequestInit): Promise<T> {
+export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
   const token = getToken();
   const r = await fetch(`/api${path}`, {
@@ -125,14 +155,22 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return r.json();
 }
 
-// sseUrl builds a URL for Server-Sent Events streams. SSE must NOT go through the
-// Next.js dev `/api` rewrite: that proxy buffers the streamed response, so event
-// frames never reach the browser (the EventSource opens but receives 0 messages).
-// We therefore connect straight to the Go backend, whose CORS is open. Override
-// with NEXT_PUBLIC_SSE_BASE; set it to "" to force same-origin (e.g. behind a
-// production reverse proxy that flushes SSE correctly).
-// Token is appended as ?token= because SSE bypasses the Next.js proxy and the
-// browser does not send cookies cross-port.
+// sseUrl builds a URL for Server-Sent Events streams.
+//
+// Production (static export / Docker): the Go backend serves the web UI *and* the
+// SSE streams on the same port, so we default to a same-origin (relative) URL.
+// This is what makes reverse-proxy deploys work: a page loaded from
+// https://<domain>/ connects to https://<domain>/api/..., which the proxy forwards
+// to the backend — no need to expose :8787 publicly. Hardcoding :8787 here used to
+// break exactly that (https://<domain>:8787/... is unreachable when only 443 is open).
+//
+// Dev (next dev): SSE must NOT go through the Next.js `/api` rewrite — that proxy
+// buffers the streamed response, so event frames never reach the browser (the
+// EventSource opens but receives 0 messages). So in dev only we connect straight
+// to the Go backend on :8787, whose CORS is open.
+//
+// Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
+// Token is appended as ?token= because SSE can't carry cookies cross-origin.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX 渗透测试报告 — Acme Corp
@@ -159,7 +197,9 @@ function mockReport(_task?: string): string {
 export function sseUrl(path: string): string {
   const base =
     process.env.NEXT_PUBLIC_SSE_BASE ??
-    (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8787` : "");
+    (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
+      ? `${window.location.protocol}//${window.location.hostname}:8787`
+      : "");
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
@@ -193,6 +233,13 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   return p;
 }
 
+function interceptPageQuery(page: number, size: number, filter: InterceptApprovalFilter) {
+  const query = new URLSearchParams({ page: String(page), size: String(size) });
+  if (filter.status) query.set("status", filter.status);
+  if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  return query.toString();
+}
+
 export const api = {
   // 后端应用版本号（release 时由 ldflags 注入，默认 "dev"）。
   health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
@@ -220,6 +267,7 @@ export const api = {
     seedFirstIntent?: boolean;
     planHeartbeatSeconds?: number;
     coverageEnabled?: boolean;
+    interceptRules?: AssetInterceptRuleInput[];
   }) =>
     post<Task>("/tasks", {
       name: input.name ?? "",
@@ -233,6 +281,7 @@ export const api = {
       seed_first_intent: input.seedFirstIntent ?? false,
       plan_heartbeat_seconds: input.planHeartbeatSeconds ?? 0, // 0 = 后端归一到默认 600(10min)
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
+      intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
     }),
   taskCategories: () => get<{ categories: TaskCategory[] }>("/task-categories").then((r) => arr(r.categories)),
   updateTask: (id: string, input: { name?: string; pinned?: boolean }) => patch<Task>(`/tasks/${id}`, input),
@@ -250,10 +299,13 @@ export const api = {
       category_id: categoryId ?? null,
     }),
   taskTemplates: () => get<{ templates: TaskTemplate[] }>("/task-templates").then((r) => arr(r.templates)),
-  createTaskTemplate: (input: Pick<TaskTemplate, "name" | "description" | "goal">) =>
-    post<TaskTemplate>("/task-templates", input),
-  updateTaskTemplate: (id: number, input: Partial<Pick<TaskTemplate, "name" | "description" | "goal">>) =>
-    patch<TaskTemplate>(`/task-templates/${id}`, input),
+  createTaskTemplate: (
+    input: Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">,
+  ) => post<TaskTemplate>("/task-templates", input),
+  updateTaskTemplate: (
+    id: number,
+    input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
+  ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
   updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
     put<{
@@ -293,12 +345,19 @@ export const api = {
   deleteTaskArchive: (id: number) => del<TaskArchive>(`/task-archives/${id}`),
   deleteTaskArchives: (archiveIds: number[]) =>
     post<{ items: ArchiveBatchItem[] }>("/task-archives/delete/batch", { archive_ids: archiveIds }),
-  controlIntent: (taskId: string, intentId: string, action: "pause" | "resume" | "cancel", reason?: string) =>
+  controlIntent: (
+    taskId: string,
+    intentId: string,
+    action: "pause" | "resume" | "cancel",
+    reason?: string,
+    // cancel 专用:soft(默认,假删除,意图置 deleted + 记删除原因)| hard(真删除,级联移除独占子孙)。
+    mode?: "soft" | "hard",
+  ) =>
     post<{
       id: number;
-      state: "paused" | "open" | "stopped";
+      state: "paused" | "open" | "deleted" | "";
       deleted?: { intents: number; facts: number; findings: number; activities: number };
-    }>(`/tasks/${taskId}/intents/${intentId}/control`, { action, reason: reason ?? "" }),
+    }>(`/tasks/${taskId}/intents/${intentId}/control`, { action, reason: reason ?? "", mode: mode ?? "soft" }),
   sendWorkerMessage: (taskId: string, intentId: string, message: string, requestId: string) =>
     post<{
       id: number;
@@ -357,6 +416,18 @@ export const api = {
   // 删除约束。
   deleteConstraint: (id: string, constraintId: string) =>
     del<{ ok: boolean }>(`/tasks/${id}/constraints/${constraintId}`),
+
+  // ---- 任务级资产拦截/允许规则（总览）----
+  taskInterceptRules: (id: string) =>
+    get<{ rules: AssetInterceptRule[] | null }>(`/tasks/${id}/intercept-rules`).then((r) => arr(r.rules)),
+  createTaskInterceptRule: (id: string, rule: AssetInterceptRuleInput) =>
+    post<AssetInterceptRule>(`/tasks/${id}/intercept-rules`, rule),
+  updateTaskInterceptRule: (id: string, ruleId: number, rule: AssetInterceptRuleInput) =>
+    put<AssetInterceptRule>(`/tasks/${id}/intercept-rules/${ruleId}`, rule),
+  deleteTaskInterceptRule: (id: string, ruleId: number) =>
+    del<{ deleted: boolean }>(`/tasks/${id}/intercept-rules/${ruleId}`),
+  toggleTaskInterceptRule: (id: string, ruleId: number, enabled: boolean) =>
+    post<{ ok: boolean; enabled: boolean }>(`/tasks/${id}/intercept-rules/${ruleId}/toggle`, { enabled }),
 
   // 本任务测试范围列表（含继承自来源任务的范围）。
   taskScope: (id: string) => get<{ scope: TaskScopeRow[] }>(`/tasks/${id}/scope`),
@@ -428,6 +499,12 @@ export const api = {
   taskAssets: (taskId: string, type = "", limit = 50, offset = 0) =>
     get<{ count: number; total: number; assets: Asset[] }>(
       `/assets?task_id=${encodeURIComponent(taskId)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}`,
+    ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
+  // DSL search scoped to a task — the backend forces the task_id filter, so it
+  // always stays within that task's assets (same DSL grammar as `searchAssets`).
+  searchTaskAssets: (taskId: string, dsl: string, type = "", limit = 50, offset = 0) =>
+    get<{ count: number; total: number; assets: Asset[] }>(
+      `/assets?task_id=${encodeURIComponent(taskId)}&dsl=${encodeURIComponent(dsl)}&type=${encodeURIComponent(type)}&limit=${limit}&offset=${offset}`,
     ).then((r) => ({ assets: r?.assets ?? [], total: r?.total ?? r?.count ?? 0 })),
   attachTaskAssets: (taskId: string, assetIds: number[], sourceSummary: string) =>
     post<TaskAssetMutation>(`/tasks/${taskId}/assets`, {
@@ -524,6 +601,73 @@ export const api = {
     get<Finding>(
       `/exploration/findings/${id}${contextTaskId ? `?context_task=${encodeURIComponent(contextTaskId)}` : ""}`,
     ),
+  findingTraffic: (id: string, contextTask?: string) =>
+    get<FindingTraffic>(
+      `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+    ),
+  bindFindingTraffic: (id: string, traffic_refs: TrafficEvidenceRef[], contextTask?: string) =>
+    post<FindingTraffic>(
+      `/exploration/findings/${id}/traffic${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { traffic_refs },
+    ),
+  editFindingTraffic: (
+    id: string,
+    bindingId: string,
+    version: number,
+    fields: { role: TrafficEvidenceRole; note: string },
+    contextTask?: string,
+  ) =>
+    patch<FindingTraffic>(
+      `/exploration/findings/${id}/traffic/${bindingId}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { version, ...fields },
+    ),
+  removeFindingTraffic: (id: string, bindingId: string, version: number, contextTask?: string) =>
+    del<FindingTraffic>(
+      `/exploration/findings/${id}/traffic/${bindingId}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { version },
+    ),
+  orderFindingTraffic: (id: string, binding_ids: string[], version: number, contextTask?: string) =>
+    http<FindingTraffic>(
+      `/exploration/findings/${id}/traffic/order${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { method: "PUT", body: JSON.stringify({ binding_ids, version }) },
+    ),
+  findingTrafficDetail: (id: string, bindingId: string, contextTask?: string) =>
+    get<FindingTrafficDetail>(
+      `/exploration/findings/${id}/traffic/${bindingId}${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
+    ),
+  findingTrafficBody: (
+    id: string,
+    bindingId: string,
+    side: "request" | "response",
+    offset: number,
+    contextTask?: string,
+  ) =>
+    get<EvidenceBodyPreview>(
+      `/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&offset=${offset}${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
+    ),
+  downloadFindingTrafficBody: async (
+    id: string,
+    bindingId: string,
+    side: "request" | "response",
+    contextTask?: string,
+  ) => {
+    const token = getToken();
+    const response = await fetch(
+      `/api/exploration/findings/${id}/traffic/${bindingId}/body?side=${side}&download=1${contextTask ? `&context_task=${encodeURIComponent(contextTask)}` : ""}`,
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+    );
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: "下载失败" }));
+      throw new Error(error.error ?? "下载失败");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `evidence-${bindingId}-${side}.bin`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  },
   // 漏洞链路:该漏洞节点回溯到任务初始节点的子图(节点 + 关系)。
   findingLineage: (id: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/findings/${id}/lineage`),
   setFindingStatus: (id: string, status: FindingStatus) => patch<Finding>(`/exploration/findings/${id}`, { status }),
@@ -535,6 +679,16 @@ export const api = {
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
+  findingRetests: (id: string) =>
+    get<{ retests: FindingRetest[] }>(`/exploration/findings/${encodeURIComponent(id)}/retests`).then((r) =>
+      arr(r.retests),
+    ),
+  activeFindingRetests: () =>
+    get<{ retests: ActiveFindingRetest[] }>("/exploration/findings/retests/active").then((r) => arr(r.retests)),
+  startFindingRetest: (id: string, notes: string) =>
+    post<{ retest: FindingRetest; created: boolean }>(`/exploration/findings/${encodeURIComponent(id)}/retests`, {
+      notes,
+    }),
   deepenFinding: (id: string, description: string) =>
     post<FindingDeepenResponse>(`/exploration/findings/${id}/deepen`, { description }),
   intents: (task?: string) => get<TaskNode[]>(`/exploration/intents${tq(task)}`).then(arr),
@@ -552,6 +706,26 @@ export const api = {
       .then(arr)
       .catch(() => [] as ConvTokenSummary[]),
   explorationGraph: (task?: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/graph${tq(task)}`),
+  // 播报板:服务端按创建顺序分页的探索节点(默认最新在前)。
+  explorationNodes: (task: string, query: ExplorationNodeQuery = {}) => {
+    const q = new URLSearchParams();
+    if (task) q.set("task", task);
+    q.set("page", String(query.page ?? 1));
+    q.set("size", String(query.size ?? 20));
+    if (query.kinds?.length) q.set("kind", query.kinds.join(","));
+    if (query.states?.length) q.set("state", query.states.join(","));
+    if (query.q?.trim()) q.set("q", query.q.trim());
+    if (query.order === "asc") q.set("order", "asc");
+    return get<ExplorationNodePage>(`/exploration/nodes?${q.toString()}`).then((r) => ({
+      items: arr(r.items),
+      total: r.total ?? 0,
+      page: r.page ?? 1,
+      size: r.size ?? query.size ?? 20,
+      edges: arr(r.edges),
+      refs: r.refs ?? {},
+      assets: r.assets ?? {},
+    }));
+  },
   activity: (task?: string, opts?: { intent?: string; since?: number; limit?: number }) => {
     const q = new URLSearchParams();
     if (task) q.set("task", task);
@@ -595,19 +769,54 @@ export const api = {
     }));
   },
 
+  // Main-agent conversation segments of a task. Each segment is a resettable session
+  // (clean transcript/context) over the same task; `current` is the writable one.
+  mainSessions: (task: string) =>
+    get<{ sessions: { seq: number; created_at: string }[]; current: number }>(
+      `/exploration/main-sessions${tq(task)}`,
+    ).then((r) => ({ sessions: arr(r.sessions), current: r.current ?? 0 })),
+  // Start a fresh main-agent session segment (does not touch the task's graph/assets/goal).
+  newMainSession: (task: string) =>
+    post<{ seq: number; created_at: string; current: number }>(`/exploration/main-session/new${tq(task)}`),
+
   // ---- traffic / audit / report / chat ----
   audit: (task?: string) => get<Audit>(`/audit${tq(task)}`),
-  traffic: (page = 0, size = 100, host = "", method = "", q = "") =>
+  traffic: (
+    page = 0,
+    size = 100,
+    host = "",
+    method = "",
+    q = "",
+    opts: {
+      body?: string;
+      path?: string;
+      status?: string;
+      respMin?: string;
+      respMax?: string;
+      sort?: string;
+      order?: string;
+    } = {},
+  ) =>
     get<TrafficResp>(
       `/traffic?page=${page}&size=${size}` +
         (host ? `&host=${encodeURIComponent(host)}` : "") +
         (method && method !== "all" ? `&method=${encodeURIComponent(method)}` : "") +
-        (q ? `&q=${encodeURIComponent(q)}` : ""),
+        (q ? `&q=${encodeURIComponent(q)}` : "") +
+        (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
+        (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
+        (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
+        (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
+        (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
+        (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
+  // Purges every exchange and compacts the index; `reclaimed` is the bytes of
+  // index handed back to the filesystem. Evidence bound to findings is kept.
+  trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
 
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
@@ -619,6 +828,49 @@ export const api = {
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
+
+  // ---- 漏洞 IM 推送 ----
+  // 渠道是多实例资源（同一类型可配多个机器人、各有过滤规则），因此独立成组，
+  // 不塞进扁平的 settings 键值里。
+  notifyMeta: () => get<NotificationMeta>(`/notify/meta`),
+  notifyChannels: () =>
+    get<{ channels: NotificationChannel[] }>(`/notify/channels`).then((r) => arr(r.channels)),
+  notifyCreateChannel: (payload: {
+    name: string;
+    kind: string;
+    enabled?: boolean;
+    mode?: string;
+    config: Record<string, unknown>;
+    filter?: NotificationFilter;
+    rate_per_min?: number;
+  }) => post<{ id: number }>(`/notify/channels`, payload),
+  // PATCH 语义：只提交要改的字段。config 里的掩码值原样回传即表示「保持原值」。
+  notifyUpdateChannel: (
+    id: number,
+    payload: {
+      name?: string;
+      kind?: string;
+      enabled?: boolean;
+      mode?: string;
+      config?: Record<string, unknown>;
+      filter?: NotificationFilter;
+      rate_per_min?: number;
+    },
+  ) => patch<{ id: number }>(`/notify/channels/${id}`, payload),
+  notifyDeleteChannel: (id: number) => del<{ ok: boolean }>(`/notify/channels/${id}`),
+  // 同步发一条测试消息；失败时后端会把渠道的原始错误回传，供排查配置。
+  notifyTestChannel: (id: number) => post<{ ok: boolean; latency_ms: number }>(`/notify/channels/${id}/test`),
+  notifyDeliveries: (q: { channelId?: number; state?: string; page?: number; pageSize?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.channelId) p.set("channel_id", String(q.channelId));
+    if (q.state) p.set("state", q.state);
+    p.set("page", String(q.page ?? 1));
+    p.set("page_size", String(q.pageSize ?? 50));
+    return get<{ deliveries: NotificationDelivery[]; total: number; page: number; page_size: number }>(
+      `/notify/deliveries?${p.toString()}`,
+    ).then((r) => ({ ...r, deliveries: arr(r.deliveries) }));
+  },
+  notifyRetryDelivery: (id: number) => post<{ ok: boolean }>(`/notify/deliveries/${id}/retry`),
   report: async (task?: string) => {
     if (MOCK) return mockReport(task);
     const token = getToken();
@@ -628,8 +880,13 @@ export const api = {
     if (!r.ok) throw new Error(`report: ${r.status}`);
     return r.text();
   },
-  chat: (message: string, task?: string, attachments?: ChatAttachment[]) =>
-    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments }),
+  chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
+    http<{ items: ChatMention[]; next_cursor?: string }>(
+      `/chat/mentions?${new URLSearchParams({ kind, q: query, cursor })}`,
+      { signal },
+    ),
+  chat: (message: string, task?: string, attachments?: ChatAttachment[], seg?: number) =>
+    post<{ reply: string; mode: string }>(`/chat${tq(task)}`, { message, attachments, seg }),
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // 方式1 文件上传:落到会话/任务工作目录 uploads/，返回可供 agent Read 的相对路径。
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
@@ -691,6 +948,7 @@ export const api = {
     reasoning_effort = "",
     profile_id?: number,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
+    session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
   ) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -703,6 +961,7 @@ export const api = {
       reasoning_effort,
       profile_id,
       streaming,
+      session_header_key,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -724,6 +983,7 @@ export const api = {
     max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
+    retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
   activateLLMProfile: (id: string) => post<{ ok: boolean }>("/llm/profiles/active", { id: Number(id) }),
@@ -731,6 +991,9 @@ export const api = {
   llmPool: () => get<LLMPoolStatus>("/llm/pool"),
   // 清除熔断，让下一次调用立刻重试该配置；不传 id = 全部清除。
   resetLLMPool: (id?: string) => post<LLMPoolStatus>("/llm/pool/reset", { id: id ? Number(id) : 0 }),
+  // 全局重试策略（五层各自的次数+间隔）。全 0 = 全部走内置默认。
+  llmRetryPolicy: () => get<LLMRetryPolicy>("/llm/retry-policy"),
+  saveLLMRetryPolicy: (p: LLMRetryPolicy) => post<LLMRetryPolicy>("/llm/retry-policy", p),
   fetchLLMModels: (provider: string, base_url: string, api_key: string, proxy = "", profile_id?: number) =>
     post<{ ok: boolean; error?: string; models?: string[] }>("/llm/models", {
       provider,
@@ -946,14 +1209,43 @@ export const api = {
   toggleInterceptRule: (id: number, enabled: boolean) =>
     post<{ ok: boolean; enabled: boolean }>(`/intercept/rules/${id}/toggle`, { enabled }),
 
+  // ---- asset intercept rules（资产拦截：全局黑名单） ----
+  assetInterceptRules: () => get<{ rules: AssetInterceptRule[] }>("/asset-intercept/rules").then((r) => arr(r.rules)),
+  createAssetInterceptRule: (rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
+    post<AssetInterceptRule>("/asset-intercept/rules", rule),
+  updateAssetInterceptRule: (id: number, rule: Pick<AssetInterceptRule, "enabled" | "kind" | "pattern" | "note">) =>
+    put<AssetInterceptRule>(`/asset-intercept/rules/${id}`, rule),
+  deleteAssetInterceptRule: (id: number) => del<{ deleted: number }>(`/asset-intercept/rules/${id}`),
+  toggleAssetInterceptRule: (id: number, enabled: boolean) =>
+    post<{ ok: boolean; enabled: boolean }>(`/asset-intercept/rules/${id}/toggle`, { enabled }),
+
   // ---- intercept pending (ask) ----
   interceptPending: () => get<{ pending: InterceptPending[] }>("/intercept/pending").then((r) => arr(r.pending)),
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
+  interceptExecution: (id: number, conversationId?: number) =>
+    get<import("@/lib/types").InterceptExecution>(
+      `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,
+    ),
+  interceptDetail: (id: number) => get<InterceptDetail>(`/intercept/history/${id}`),
   interceptHistory: () => get<{ items: InterceptApprovalRow[] }>("/intercept/history").then((r) => arr(r.items)),
+  interceptHistoryPage: (page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
+    get<{ items: InterceptApprovalRow[]; total?: number }>(
+      `/intercept/history?${interceptPageQuery(page, size, filter)}`,
+    ).then((r) => ({
+      items: arr(r.items),
+      total: r.total ?? r.items?.length ?? 0,
+    })),
   interceptTask: (taskId: string) =>
     get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${taskId}`).then((r) => arr(r.items)),
+  interceptTaskPage: (taskId: string, page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
+    get<{ items: InterceptApprovalRow[]; total?: number }>(
+      `/intercept/task/${encodeURIComponent(taskId)}?${interceptPageQuery(page, size, filter)}`,
+    ).then((r) => ({
+      items: arr(r.items),
+      total: r.total ?? r.items?.length ?? 0,
+    })),
 
   // ---- intercept tool-config (全局工具拦截范围) ----
   interceptGetToolConfig: async (): Promise<{ enabled_tools: string[] }> => {
@@ -982,6 +1274,7 @@ export const api = {
   // ---- intercept LLM judge (模型兜底审批,全局配置) ----
   interceptGetJudgeConfig: () => get<JudgeConfig>("/intercept/judge"),
   interceptSetJudgeConfig: (cfg: JudgeConfig) => put<{ ok: boolean }>("/intercept/judge", cfg),
+  interceptJudgeUsage: (days = 30) => get<JudgeUsage>(`/intercept/judge/usage?days=${days}`),
 
   // ---- commands (tool execution history, any tool) ----
   commands: (params?: { task?: string; q?: string; page?: number; size?: number }) => {
@@ -1017,4 +1310,54 @@ export const api = {
   // per-agent 绑定 / 轮询 / 中断消耗都覆盖）。
   tokensByModel: (task: string) =>
     get<{ models: ModelTokenStat[] }>(`/llm/records/by-model?task=${encodeURIComponent(task)}`),
+
+  // ---- WebShell 连接管理 ----
+  webShells: (params?: { taskId?: number; q?: string; status?: string; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.taskId) sp.set("task_id", String(params.taskId));
+    if (params?.q?.trim()) sp.set("q", params.q.trim());
+    if (params?.status && params.status !== "all") sp.set("status", params.status);
+    sp.set("limit", String(params?.limit ?? 200));
+    return get<{ items: WebShell[]; total: number }>(`/webshells?${sp}`).then((r) => ({
+      items: arr(r.items),
+      total: r.total ?? 0,
+    }));
+  },
+  webShell: (id: number) => get<WebShellDetail>(`/webshells/${id}`),
+  createWebShell: (input: WebShellInput) => post<WebShellDetail>("/webshells", input),
+  updateWebShell: (id: number, input: WebShellInput) =>
+    patch<WebShellDetail>(`/webshells/${id}`, input),
+  deleteWebShell: (id: number) => del<{ ok: boolean; id: number }>(`/webshells/${id}`),
+  testWebShell: (id: number) => post<WebShellTestResult>(`/webshells/${id}/test`),
+  webShellExec: (id: number, command: string) =>
+    post<WebShellExecResult>(`/webshells/${id}/exec`, { command }),
+  webShellInfo: (id: number) => get<WebShellInfo>(`/webshells/${id}/info`),
+  webShellFiles: (id: number, path = "") =>
+    get<WebShellFileListing>(`/webshells/${id}/files?path=${encodeURIComponent(path)}`),
+  webShellReadFile: (id: number, path: string, offset = 0, length = 256 * 1024) =>
+    get<WebShellFileData>(
+      `/webshells/${id}/files/read?path=${encodeURIComponent(path)}&offset=${offset}&length=${length}`,
+    ),
+  webShellWriteFile: (id: number, path: string, dataB64: string) =>
+    post<{ ok: boolean; path: string; bytes: number }>(`/webshells/${id}/files/write`, {
+      path,
+      data_b64: dataB64,
+    }),
+  webShellDeleteFile: (id: number, path: string) =>
+    post<{ ok: boolean; output: string }>(`/webshells/${id}/files/delete`, { path }),
+  webShellMkdir: (id: number, path: string) =>
+    post<{ ok: boolean; output: string }>(`/webshells/${id}/files/mkdir`, { path }),
+  webShellRename: (id: number, path: string, to: string) =>
+    post<{ ok: boolean; output: string }>(`/webshells/${id}/files/rename`, { path, to }),
+
+  // ---- 一键更新 ----
+  // 检查以后端为准：下载是后端做的，浏览器能连 GitHub 而服务器连不上的情况很常见
+  // （服务器在内网、代理只配在浏览器上），那时点更新必然失败。
+  // 后端对 GitHub 的查询结果有 30 分钟缓存（未认证的 GitHub API 是 60 次/小时/IP，
+  // 顶栏每次整页加载都会查一次，不缓存会很快耗光配额）。force=true 强制回源，
+  // 留给用户显式点「检查更新」时用。
+  checkUpdate: (force = false) => get<UpdateCheck>(`/update/check${force ? "?force=1" : ""}`),
+  // 202 即返回，实际下载在后台跑，进度走 /api/update/stream。
+  applyUpdate: () => post<{ ok: boolean; target: string }>(`/update/apply`),
+  rollbackUpdate: () => post<{ ok: boolean }>(`/update/rollback`),
 };

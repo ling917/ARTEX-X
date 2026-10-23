@@ -6,6 +6,7 @@ import {
   ArrowUpIcon,
   Bot,
   ChevronDownIcon,
+  ChevronRightIcon,
   ListChecksIcon,
   Loader2Icon,
   MoreHorizontalIcon,
@@ -21,7 +22,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { MentionTextarea } from "@/components/mention-textarea";
+import { SideQuestionButton, SideQuestionWorkspace } from "@/components/side-question-workspace";
 import { TodoPopover } from "@/components/todo-popover";
+import { ApprovalExecutionFocus, useApprovalFocus, useApprovalHistory } from "@/components/approval-execution-focus";
 import { Transcript } from "@/components/transcript";
 import {
   AlertDialog,
@@ -46,10 +50,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
+import { useSideQuestions } from "@/hooks/use-side-questions";
+import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
+import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
+import { isBtwCommand } from "@/lib/side-questions";
 import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -83,8 +91,44 @@ function fmtDuration(ms: number): string {
 const HISTORY_PAGE = 200;
 const CONVERSATION_LIST_PAGE = 100;
 
+// Which agent groups the user has collapsed in the left rail. Persisted so the
+// rail looks the same after a reload; unknown keys are harmless (a deleted agent
+// simply never renders a group again).
+const COLLAPSED_AGENTS_KEY = "artex.chat.collapsed-agents";
+
 function conversationIsPinned(conversation: Conversation): boolean {
   return conversation.pinned ?? Boolean(conversation.pinned_at);
+}
+
+// AgentGroup is one collapsible section of the left rail: all unpinned
+// conversations of a single agent, newest activity first.
+interface AgentGroup {
+  key: string;
+  name: string;
+  conversations: Conversation[];
+  runningCount: number;
+}
+
+// groupByAgent buckets conversations by agent, preserving the incoming order
+// both inside a group and across groups. The server already sorts by updated_at
+// DESC, so first-appearance order == most-recently-active group first.
+function groupByAgent(conversations: Conversation[], agentByKey: Map<string, Agent>): AgentGroup[] {
+  const groups = new Map<string, AgentGroup>();
+  for (const conversation of conversations) {
+    let group = groups.get(conversation.agent_key);
+    if (!group) {
+      group = {
+        key: conversation.agent_key,
+        name: agentByKey.get(conversation.agent_key)?.name || conversation.agent_key,
+        conversations: [],
+        runningCount: 0,
+      };
+      groups.set(conversation.agent_key, group);
+    }
+    group.conversations.push(conversation);
+    if (conversation.running) group.runningCount++;
+  }
+  return [...groups.values()];
 }
 
 // LiveBadge is the small pulsing "实时" chip reused from the task's main-agent
@@ -114,6 +158,7 @@ function Composer({
   onPickFiles,
   onRemoveAttachment,
   uploading,
+  allowBtw,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -126,9 +171,10 @@ function Composer({
   stopDisabled?: boolean;
   // 方式1 文件上传:传了 onPickFiles 才显示回形针按钮 + 附件 chip 预览。
   attachments?: ChatAttachment[];
-  onPickFiles?: (files: FileList | null) => void;
+  onPickFiles?: (files: File[]) => void;
   onRemoveAttachment?: (path: string) => void;
   uploading?: boolean;
+  allowBtw?: boolean;
 }) {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const atts = attachments ?? [];
@@ -166,7 +212,7 @@ function Composer({
           ))}
         </div>
       )}
-      <div className="flex flex-wrap items-end gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {leftSlot ? <div className="w-full sm:w-auto">{leftSlot}</div> : null}
         {onPickFiles && (
           <>
@@ -176,8 +222,11 @@ function Composer({
               multiple
               className="hidden"
               onChange={(e) => {
-                onPickFiles(e.target.files);
+                // FileList 与 input 元素活绑定:必须先快照成数组,再清空 value,
+                // 否则异步的 onPickFiles(比如草稿态要先建会话)恢复执行时会拿到空列表。
+                const picked = Array.from(e.target.files ?? []);
                 e.target.value = ""; // allow re-picking the same file
+                if (picked.length > 0) onPickFiles(picked);
               }}
             />
             <Button
@@ -191,15 +240,20 @@ function Composer({
             </Button>
           </>
         )}
-        <Textarea
+        <MentionTextarea
           className="max-h-40 min-h-10 min-w-0 flex-1 resize-none"
           rows={1}
           placeholder={placeholder}
           value={value}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.value)}
+          disabled={disabled && !(running && allowBtw)}
+          onValueChange={onChange}
           onKeyDown={onKeyDown}
         />
+        {running && allowBtw && isBtwCommand(value) && (
+          <Button size="icon" onClick={onSend} aria-label="发送旁路问题" title="发送旁路问题">
+            <ArrowUpIcon />
+          </Button>
+        )}
         {running ? (
           // while a run is in flight the send button becomes a stop button —
           // aborts just this session (the trigger queue keeps going).
@@ -243,15 +297,17 @@ function LLMProfileRow({
   const label = current ? current.name : `默认${activeDefault ? `（${activeDefault.name}）` : ""}`;
 
   return (
-    <div className="flex items-center gap-1 px-1 pb-1 pt-0.5">
+    <div className="flex min-w-0 shrink-0 items-center gap-1 px-1 pt-0.5 pb-1">
       <ZapIcon className="text-muted-foreground/50 size-3 shrink-0" />
-      <span className="text-muted-foreground/70 text-xs">{label}</span>
+      <span className="truncate text-muted-foreground/70 text-xs" title={label}>
+        {label}
+      </span>
       <Popover open={open} onOpenChange={disabled ? undefined : setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
             disabled={disabled}
-            className="text-primary flex items-center gap-0.5 text-xs hover:underline disabled:pointer-events-none disabled:opacity-40"
+            className="flex shrink-0 items-center gap-0.5 text-primary text-xs hover:underline disabled:pointer-events-none disabled:opacity-40"
           >
             更换
             <ChevronDownIcon className="size-3" />
@@ -349,12 +405,12 @@ function DraftChat({
   // into it, then hands off to ChatView carrying the typed text + attachments (the
   // user sends from there). Mirrors the task main-agent console's upload, adapted to
   // the ChatGPT-style lazy-create flow.
-  async function pickFiles(files: FileList | null) {
-    if (!files || files.length === 0 || !agentKey || uploading || sending) return;
+  async function pickFiles(files: File[]) {
+    if (files.length === 0 || !agentKey || uploading || sending) return;
     setUploading(true);
     try {
       const c = await api.createConversation(agentKey, "", llmProfileId);
-      const r = await api.chatUpload("session", `conv-${c.id}`, Array.from(files));
+      const r = await api.chatUpload("session", `conv-${c.id}`, files);
       onStarted(c, { input, attachments: r.attachments });
     } catch (e) {
       toast.error("上传失败：" + (e as Error).message);
@@ -364,23 +420,25 @@ function DraftChat({
 
   const agentPicker = (
     <Select value={agentKey} onValueChange={setAgentKey}>
-      <SelectTrigger size="sm" className="w-full sm:w-40">
+      <SelectTrigger className="w-full sm:w-40">
         <SelectValue placeholder="选择 Agent…" />
       </SelectTrigger>
       <SelectContent>
-        {agents.map((a) => (
-          <SelectItem key={a.key} value={a.key}>
-            <span className="flex items-center gap-2">
-              <Bot className="size-3.5" />
-              {a.name}
-              {!a.builtin && (
-                <Badge variant="outline" className="px-1 py-0 text-[9px]">
-                  自定义
-                </Badge>
-              )}
-            </span>
-          </SelectItem>
-        ))}
+        <SelectGroup>
+          {agents.map((a) => (
+            <SelectItem key={a.key} value={a.key}>
+              <span className="flex items-center gap-2">
+                <Bot className="size-3.5" />
+                {a.name}
+                {!a.builtin && (
+                  <Badge variant="outline" className="px-1 py-0 text-[9px]">
+                    自定义
+                  </Badge>
+                )}
+              </span>
+            </SelectItem>
+          ))}
+        </SelectGroup>
       </SelectContent>
     </Select>
   );
@@ -401,7 +459,7 @@ function DraftChat({
         onChange={setInput}
         onSend={send}
         disabled={sending || uploading || !agentKey}
-        placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+        placeholder="输入消息，@ 引用记录，Enter 发送"
         leftSlot={agentPicker}
         onPickFiles={pickFiles}
         uploading={uploading}
@@ -436,6 +494,7 @@ function ChatView({
   onTitleMaybeChanged: () => void;
   onConvUpdated: () => void;
 }) {
+  const approvalFocus = useApprovalFocus({ conversationId: conv.id });
   const [messages, setMessages] = React.useState<Activity[]>([]);
   const [running, setRunning] = React.useState(false);
   const [input, setInput] = React.useState(initial?.input ?? "");
@@ -448,9 +507,11 @@ function ChatView({
   const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
+  const [historyLoaded, setHistoryLoaded] = React.useState(false);
   const [hasMore, setHasMore] = React.useState(false); // drives the "load earlier" hint
   const agent = agents.find((a) => a.key === conv.agent_key);
   const currentProfileId = conv.llm_profile_id ?? null;
+  const side = useSideQuestions(`/api/conversations/${conv.id}`);
 
   async function changeProfile(id: number | null) {
     try {
@@ -484,51 +545,76 @@ function ChatView({
     hasMoreRef.current = false;
     setHasMore(false);
     setMessages([]);
+    setHistoryLoaded(false);
     setRunning(false);
     let live = true;
     api
       .conversationHistory(conv.id, 0, HISTORY_PAGE)
       .then((r) => {
         if (!live) return;
-        setMessages(r.items);
-        cursorRef.current = r.cursor; // newest id → incremental-tail anchor
+        setMessages((current) => mergeActivities(r.items, current));
+        cursorRef.current = Math.max(cursorRef.current, r.cursor);
         earliestRef.current = r.items.length ? r.items[0].seq : 0;
         hasMoreRef.current = r.hasMore;
         setHasMore(r.hasMore);
-        setRunning(r.running);
+        setRunning((current) => current || r.running);
+        setHistoryLoaded(true);
       })
       .catch(() => {
-        /* The empty state remains usable when history loading fails. */
+        // A source link can retry history through its locator; ordinary chats
+        // retain the existing usable empty state on a transient failure.
+        if (live) setHistoryLoaded(true);
       });
     return () => {
       live = false;
     };
   }, [conv.id]);
 
+  // A trigger or another tab may start a turn while this conversation is open.
+  // A false list snapshot must not stop the tail before its final messages load.
+  React.useEffect(() => {
+    if (conv.running) setRunning(true);
+  }, [conv.running]);
+
   // poll while a turn is running: pull new steps after the cursor.
   React.useEffect(() => {
     if (!running) return;
     let live = true;
+    let timer: ReturnType<typeof setTimeout>;
     const tick = async () => {
+      let keepPolling = true;
       try {
         const r = await api.conversationMessages(conv.id, cursorRef.current);
         if (!live) return;
         if (r.items.length) {
-          setMessages((prev) => [...prev, ...r.items]);
-          cursorRef.current = r.cursor;
+          setMessages((prev) => mergeActivities(prev, r.items));
         }
+        cursorRef.current = Math.max(cursorRef.current, r.cursor);
+        keepPolling = r.running;
         setRunning(r.running);
         if (!r.running) onTitleMaybeChanged(); // first-turn auto-title landed
       } catch {
         /* transient — keep polling */
+      } finally {
+        // Slow responses must not overlap another poll with the same cursor.
+        if (live && keepPolling) timer = setTimeout(() => void tick(), 1000);
       }
     };
-    const h = setInterval(tick, 1000);
+    void tick();
     return () => {
       live = false;
-      clearInterval(h);
+      clearTimeout(timer);
     };
   }, [running, conv.id, onTitleMaybeChanged]);
+
+  const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
+  const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
+    setMessages((prev) => mergeActivities(page.items, prev));
+    earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
+    hasMoreRef.current = page.hasMore;
+    setHasMore(page.hasMore);
+  }, []);
+  const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
 
   // ---- transcript auto-scroll (open → bottom; stick to bottom unless scrolled up) ----
   const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -549,10 +635,7 @@ function ChatView({
     try {
       const r = await api.conversationHistory(conv.id, earliestRef.current, HISTORY_PAGE);
       if (r.items.length) {
-        setMessages((prev) => {
-          const seen = new Set(prev.map((a) => a.seq));
-          return [...r.items.filter((a) => !seen.has(a.seq)), ...prev];
-        });
+        setMessages((prev) => mergeActivities(r.items, prev));
         earliestRef.current = r.items[0].seq;
       }
       hasMoreRef.current = r.hasMore;
@@ -571,12 +654,13 @@ function ChatView({
     const vp = viewport();
     if (!vp) return;
     const onScroll = () => {
+      if (approvalFocus.state && !focusHistory.ready) return;
       atBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 60;
       if (vp.scrollTop <= 80) void loadEarlier(); // near top → pull an older page
     };
     vp.addEventListener("scroll", onScroll, { passive: true });
     return () => vp.removeEventListener("scroll", onScroll);
-  }, [viewport, loadEarlier]);
+  }, [viewport, loadEarlier, approvalFocus.state, focusHistory.ready]);
   // open/switch a conversation → jump to the latest (bottom)
   // biome-ignore lint/correctness/useExhaustiveDependencies: changing conversations intentionally retriggers the scroll reset.
   React.useLayoutEffect(() => {
@@ -589,10 +673,10 @@ function ChatView({
   // new activity → stick to bottom only if the user is already pinned there
   // biome-ignore lint/correctness/useExhaustiveDependencies: message and running changes intentionally retrigger bottom anchoring.
   React.useLayoutEffect(() => {
-    if (!atBottomRef.current) return;
+    if (approvalFocus.state || !atBottomRef.current) return;
     const vp = viewport();
     if (vp) vp.scrollTop = vp.scrollHeight;
-  }, [messages, running, viewport]);
+  }, [messages, running, viewport, approvalFocus.state]);
 
   // Per-conversation token total, live — same accounting as the main-agent
   // console: completed runs' `result` sum + the in-progress run's latest `usage`.
@@ -625,11 +709,11 @@ function ChatView({
 
   // pickFiles uploads into this conversation's session dir (sessions/conv-<id>/
   // uploads/) and queues the returned metadata to send with the next message.
-  async function pickFiles(files: FileList | null) {
-    if (!files || files.length === 0) return;
+  async function pickFiles(files: File[]) {
+    if (files.length === 0) return;
     setUploading(true);
     try {
-      const r = await api.chatUpload("session", `conv-${conv.id}`, Array.from(files));
+      const r = await api.chatUpload("session", `conv-${conv.id}`, files);
       setAttachments((prev) => [...prev, ...r.attachments]);
     } catch (e) {
       toast.error("上传失败：" + (e as Error).message);
@@ -641,17 +725,16 @@ function ChatView({
   async function send() {
     const msg = input.trim();
     const atts = attachments;
+    if (side.handleCommand(msg, () => setInput(""))) return;
     if ((!msg && atts.length === 0) || sending || running) return;
     setSending(true);
     setInput("");
     setAttachments([]);
     try {
       await api.sendConversationMessage(conv.id, msg, atts.length ? atts : undefined);
+      // The live loop pulls the persisted human turn immediately. Sharing that
+      // fetch avoids racing a separate post-send request against the poller.
       setRunning(true);
-      // pull the just-persisted human turn immediately.
-      const r = await api.conversationMessages(conv.id, cursorRef.current);
-      setMessages((prev) => [...prev, ...r.items]);
-      cursorRef.current = r.cursor;
     } catch (e) {
       toast.error("发送失败：" + (e as Error).message);
       setInput(msg); // restore so the user doesn't lose their text
@@ -677,7 +760,7 @@ function ChatView({
   }
 
   return (
-    <>
+    <SideQuestionWorkspace side={side} label={agent?.name ?? conv.agent_key} composerLayout="inline">
       {/* header: which agent + live + token meta */}
       <div className="flex min-w-0 flex-wrap items-center gap-2 border-b px-4 py-2.5">
         <Bot className="text-muted-foreground size-4 shrink-0" />
@@ -692,6 +775,7 @@ function ChatView({
           <span className="text-muted-foreground min-w-0 truncate text-xs">{agent.description}</span>
         )}
         {running && <LiveBadge />}
+        <SideQuestionButton side={side} />
         <div className="text-muted-foreground ml-auto flex min-w-0 max-w-full items-center justify-end gap-x-3 gap-y-1 text-xs max-sm:w-full max-sm:flex-wrap">
           {tokenTotal.turns > 0 && (
             <span title="agent 循环轮次（模型调用次数）" className="tabular-nums">
@@ -706,6 +790,8 @@ function ChatView({
         </div>
       </div>
 
+      <ApprovalExecutionFocus focus={approvalFocus} history={focusHistory} />
+
       {/* messages */}
       <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
         <div className="min-w-0 max-w-full px-4 py-3" ref={contentRef}>
@@ -718,7 +804,7 @@ function ChatView({
               {hasMore && (
                 <div className="text-muted-foreground/70 pb-2 text-center text-[11px]">向上滚动加载更早的消息…</div>
               )}
-              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} />
+              <Transcript activity={messages} live={running} chat fetchDetail={fetchDetail} focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined} />
             </>
           )}
         </div>
@@ -728,8 +814,9 @@ function ChatView({
         value={input}
         onChange={setInput}
         onSend={send}
-        disabled={running}
-        placeholder={running ? "Agent 正在回复…" : "输入消息，Enter 发送，Shift+Enter 换行"}
+        disabled={running || sending}
+        allowBtw
+        placeholder={running ? "Agent 正在回复，可输入 /btw 提问…" : "输入消息，@ 引用记录，Enter 发送"}
         running={running}
         onStop={stop}
         stopDisabled={stopping}
@@ -745,15 +832,17 @@ function ChatView({
         disabled={running || sending}
         rightSlot={<TodoPopover seq={latestTodoSeq} fetchDetail={fetchDetail} />}
       />
-    </>
+    </SideQuestionWorkspace>
   );
 }
 
 // ConversationItem is one row in the left rail: title, agent subtitle, inline
-// rename, pin marker, and a compact action menu.
+// rename, pin marker, and a compact action menu. Rows nested under an agent
+// group drop the agent subtitle (showAgent=false) — the header already says it.
 const ConversationItem = React.memo(function ConversationItem({
   conv,
   agent,
+  showAgent = true,
   active,
   renaming,
   renameText,
@@ -770,6 +859,7 @@ const ConversationItem = React.memo(function ConversationItem({
 }: {
   conv: Conversation;
   agent?: Agent;
+  showAgent?: boolean;
   active: boolean;
   renaming: boolean;
   renameText: string;
@@ -840,11 +930,21 @@ const ConversationItem = React.memo(function ConversationItem({
           <div className="flex min-w-0 items-center gap-1.5">
             {pinned && <PinIcon className="text-primary size-3 shrink-0" aria-label="已置顶" />}
             <div className="truncate text-sm">{conv.title || "新对话"}</div>
+            {conv.running ? (
+              <Badge variant="secondary" className="shrink-0 gap-1" title="Agent 正在运行">
+                <Spinner className="size-3" aria-hidden="true" />
+                运行中
+              </Badge>
+            ) : null}
           </div>
           <div className="text-muted-foreground flex min-w-0 items-center gap-1 text-[11px]">
-            <Bot className="size-3 shrink-0" />
-            <span className="min-w-0 truncate">{agent?.name ?? conv.agent_key}</span>
-            <span className="shrink-0">·</span>
+            {showAgent && (
+              <>
+                <Bot className="size-3 shrink-0" />
+                <span className="min-w-0 truncate">{agent?.name ?? conv.agent_key}</span>
+                <span className="shrink-0">·</span>
+              </>
+            )}
             <span className="shrink-0">
               {new Date(conv.created_at).toLocaleDateString("zh-CN", {
                 month: "numeric",
@@ -904,11 +1004,62 @@ const ConversationItem = React.memo(function ConversationItem({
   );
 });
 
+// AgentGroupHeader is the sticky, clickable divider above one agent's rows:
+// collapse chevron, agent name, a running marker, and the row count.
+function AgentGroupHeader({
+  group,
+  collapsed,
+  hasActive,
+  onToggle,
+}: {
+  group: AgentGroup;
+  collapsed: boolean;
+  hasActive: boolean;
+  onToggle: (key: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onToggle(group.key)}
+      aria-expanded={!collapsed}
+      title={collapsed ? `展开「${group.name}」` : `收起「${group.name}」`}
+      className={cn(
+        "sticky top-0 z-10 flex min-w-0 items-center gap-1.5 rounded-md bg-card px-1.5 py-1 text-left font-medium text-[11px] transition-colors hover:bg-accent/50",
+        collapsed && hasActive ? "text-foreground" : "text-muted-foreground",
+      )}
+    >
+      <ChevronRightIcon className={cn("size-3 shrink-0 transition-transform", !collapsed && "rotate-90")} />
+      <Bot className="size-3 shrink-0" />
+      <span className="min-w-0 flex-1 truncate">{group.name}</span>
+      {collapsed && hasActive && (
+        <span className="size-1.5 shrink-0 rounded-full bg-primary" title="当前对话在此分组内" />
+      )}
+      {group.runningCount > 0 && (
+        <Spinner className="size-3 shrink-0" aria-label={`${group.runningCount} 个对话运行中`} />
+      )}
+      <span className="shrink-0 tabular-nums opacity-60">{group.conversations.length}</span>
+    </button>
+  );
+}
+
 export default function ChatPage() {
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
   const [convs, setConvs] = React.useState<Conversation[]>([]);
+  const [agentFilter, setAgentFilter] = React.useState<string | null>(null);
   const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [sourceRequested, setSourceRequested] = React.useState(false);
+  const [convsLoaded, setConvsLoaded] = React.useState(false);
+  const selectConversation = React.useCallback((id: number | null) => {
+    if (id !== selectedId) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("approval");
+      setSourceRequested(false);
+      window.history.replaceState(null, "", url);
+    }
+    setSelectedId(id);
+  }, [selectedId]);
+
   const [renamingId, setRenamingId] = React.useState<number | null>(null);
   const [renameText, setRenameText] = React.useState("");
   const [selectedConversationIds, setSelectedConversationIds] = React.useState<Set<number>>(() => new Set());
@@ -919,6 +1070,9 @@ export default function ChatPage() {
   const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
   const [bulkDeleting, setBulkDeleting] = React.useState(false);
   const [visibleConversationCount, setVisibleConversationCount] = React.useState(CONVERSATION_LIST_PAGE);
+  // Collapsed agent groups. Hydrated from localStorage after mount (not a lazy
+  // useState init) so the server and client render the same first pass.
+  const [collapsedAgents, setCollapsedAgents] = React.useState<Set<string>>(() => new Set());
   // Pending text + uploaded attachments handed off from a draft that created a
   // conversation via the paperclip, keyed by the new conversation id (consumed once
   // by ChatView on mount; ids never repeat, so leftover entries are harmless).
@@ -926,11 +1080,15 @@ export default function ChatPage() {
     Record<number, { input?: string; attachments?: ChatAttachment[] }>
   >({});
 
-  const reloadConvs = React.useCallback(() => {
-    api
-      .conversations()
-      .then(setConvs)
-      .catch(() => setConvs([]));
+  const conversationListSeq = React.useRef(0);
+  const reloadConvs = React.useCallback(async () => {
+    const seq = ++conversationListSeq.current;
+    try {
+      const items = await api.conversations();
+      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+    } catch {
+      // Preserve the selected transcript and list on a transient poll failure.
+    }
   }, []);
   React.useEffect(() => {
     api
@@ -945,7 +1103,23 @@ export default function ChatPage() {
       .catch(() => {
         /* The conversation remains usable without profile labels. */
       });
-    reloadConvs();
+  }, []);
+
+  // One list poll supplies runtime state for all sidebar rows, including the
+  // unselected ones. Await completion so slow requests do not overlap.
+  React.useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function poll() {
+      await reloadConvs();
+      if (!disposed) timer = setTimeout(() => void poll(), 2000);
+    }
+    void poll();
+    return () => {
+      disposed = true;
+      conversationListSeq.current++;
+      clearTimeout(timer);
+    };
   }, [reloadConvs]);
 
   React.useEffect(() => {
@@ -957,11 +1131,34 @@ export default function ChatPage() {
     });
   }, [convs]);
 
+  React.useEffect(() => {
+    const raw = getLocalStorageValue(COLLAPSED_AGENTS_KEY);
+    if (!raw) return;
+    try {
+      const keys = JSON.parse(raw);
+      if (Array.isArray(keys))
+        setCollapsedAgents(new Set(keys.filter((key): key is string => typeof key === "string")));
+    } catch {
+      // Corrupted entry → start with everything expanded.
+    }
+  }, []);
+
+  const toggleAgentCollapsed = React.useCallback((key: string) => {
+    setCollapsedAgents((current) => {
+      const next = new Set(current);
+      if (!next.delete(key)) next.add(key);
+      setLocalStorageValue(COLLAPSED_AGENTS_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }, []);
+
   // Restore the open conversation from the URL (?c=<id>) on mount, so a refresh
   // returns to the same thread instead of the empty draft view. Runs after
   // hydration (not a lazy useState init) to avoid a server/client mismatch.
   React.useEffect(() => {
-    const c = new URLSearchParams(window.location.search).get("c");
+    const params = new URLSearchParams(window.location.search);
+    setSourceRequested(params.has("approval"));
+    const c = params.get("c");
     const id = c ? Number(c) : NaN;
     if (Number.isFinite(id)) setSelectedId(id);
   }, []);
@@ -978,17 +1175,58 @@ export default function ChatPage() {
 
   const selected = React.useMemo(() => convs.find((c) => c.id === selectedId) ?? null, [convs, selectedId]);
   const agentByKey = React.useMemo(() => new Map(agents.map((agent) => [agent.key, agent])), [agents]);
+  const filteredConversations = React.useMemo(
+    () => (agentFilter === null ? convs : convs.filter((conversation) => conversation.agent_key === agentFilter)),
+    [convs, agentFilter],
+  );
   const visibleConversations = React.useMemo(
-    () => convs.slice(0, visibleConversationCount),
-    [convs, visibleConversationCount],
+    () => filteredConversations.slice(0, visibleConversationCount),
+    [filteredConversations, visibleConversationCount],
+  );
+  // Pinned rows stay a flat block above the groups (server order = pinned_at DESC);
+  // everything else is bucketed per agent, most-recently-active agent first.
+  const pinnedConversations = React.useMemo(
+    () => visibleConversations.filter(conversationIsPinned),
+    [visibleConversations],
+  );
+  const agentGroups = React.useMemo(
+    () =>
+      groupByAgent(
+        visibleConversations.filter((c) => !conversationIsPinned(c)),
+        agentByKey,
+      ),
+    [visibleConversations, agentByKey],
   );
   // conversation agents: custom agents + conversational built-ins (role=assistant,
   // e.g. Auto / 渗透测试). The orchestration built-ins (goals/planner/mainagent/worker)
   // are task-specific and stay hidden from the chat page.
   const chatAgents = React.useMemo(() => agents.filter((a) => !a.builtin || a.role === "assistant"), [agents]);
+  const agentFilterOptions = React.useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const conversation of convs) {
+      counts.set(conversation.agent_key, (counts.get(conversation.agent_key) ?? 0) + 1);
+    }
+    // Include historical sources even if their Agent has since been disabled or deleted.
+    const keys = new Set([...chatAgents.map((agent) => agent.key), ...counts.keys()]);
+    if (agentFilter !== null) keys.add(agentFilter);
+    return [...keys]
+      .map((key) => ({ key, name: agentByKey.get(key)?.name || key, count: counts.get(key) ?? 0 }))
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  }, [convs, chatAgents, agentByKey, agentFilter]);
+  const conversationCountLabel =
+    agentFilter === null ? `共 ${convs.length} 个` : `${filteredConversations.length} / ${convs.length} 个`;
+
+  function changeAgentFilter(key: string | null) {
+    setAgentFilter(key);
+    setVisibleConversationCount(CONVERSATION_LIST_PAGE);
+    setSelectedConversationIds(new Set());
+    setBulkDeleteOpen(false);
+    setRenamingId(null);
+  }
 
   const selectedConversationCount = selectedConversationIds.size;
-  const allConversationsSelected = convs.length > 0 && selectedConversationCount === convs.length;
+  const allConversationsSelected =
+    filteredConversations.length > 0 && selectedConversationCount === filteredConversations.length;
   const someConversationsSelected = selectedConversationCount > 0 && !allConversationsSelected;
   let conversationHeaderChecked: boolean | "indeterminate" = false;
   if (allConversationsSelected) conversationHeaderChecked = true;
@@ -1004,7 +1242,9 @@ export default function ChatPage() {
   }, []);
 
   function toggleAllConversations(checked: boolean) {
-    setSelectedConversationIds(checked ? new Set(convs.map((conversation) => conversation.id)) : new Set());
+    setSelectedConversationIds(
+      checked ? new Set(filteredConversations.map((conversation) => conversation.id)) : new Set(),
+    );
   }
 
   function exitSelectionMode() {
@@ -1023,7 +1263,7 @@ export default function ChatPage() {
           next.delete(id);
           return next;
         });
-        reloadConvs();
+        void reloadConvs();
       } catch (e) {
         toast.error("删除失败：" + (e as Error).message);
       }
@@ -1045,7 +1285,7 @@ export default function ChatPage() {
           else failed.push({ id: item.id, error: item.error ?? "对话不存在" });
         }
       }
-      if (deleted.has(selectedId ?? -1)) setSelectedId(null);
+      if (deleted.has(selectedId ?? -1)) selectConversation(null);
       setSelectedConversationIds((current) => {
         const next = new Set(current);
         for (const id of deleted) next.delete(id);
@@ -1063,10 +1303,10 @@ export default function ChatPage() {
       // Fully successful → return to the clean list; keep selection mode on if
       // some failed so the user can retry the remaining ones.
       if (failed.length === 0) setSelectionMode(false);
-      reloadConvs();
+      void reloadConvs();
     } catch (error) {
       toast.error(`批量删除失败：${(error as Error).message}`);
-      reloadConvs();
+      void reloadConvs();
     } finally {
       setBulkDeleting(false);
     }
@@ -1077,7 +1317,7 @@ export default function ChatPage() {
       const pinned = conversationIsPinned(conversation);
       try {
         await api.pinConversation(conversation.id, !pinned);
-        reloadConvs();
+        void reloadConvs();
       } catch (e) {
         toast.error(`${pinned ? "取消置顶" : "置顶"}失败：${(e as Error).message}`);
       }
@@ -1096,7 +1336,7 @@ export default function ChatPage() {
       if (!title) return;
       try {
         await api.renameConversation(id, title);
-        reloadConvs();
+        void reloadConvs();
       } catch (e) {
         toast.error("重命名失败：" + (e as Error).message);
       }
@@ -1114,19 +1354,40 @@ export default function ChatPage() {
         {/* left: conversation list */}
         <div className="bg-card flex flex-col overflow-hidden rounded-lg border">
           <div className="flex flex-col gap-2 border-b p-2">
-            <Button size="sm" className="w-full" onClick={() => setSelectedId(null)}>
+            <Button size="sm" className="w-full" onClick={() => selectConversation(null)}>
               <PlusIcon /> 新建对话
             </Button>
+            <Select
+              value={agentFilter === null ? "all" : `agent:${agentFilter}`}
+              onValueChange={(value) => changeAgentFilter(value === "all" ? null : value.slice(6))}
+              disabled={bulkDeleting}
+            >
+              <SelectTrigger size="sm" className="w-full min-w-0" aria-label="按 Agent 筛选对话">
+                <Bot />
+                <SelectValue placeholder="全部 Agent" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部 Agent</SelectItem>
+                  {agentFilterOptions.map((agent) => (
+                    <SelectItem key={agent.key} value={`agent:${agent.key}`}>
+                      {agent.name}（{agent.count}）
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
             {convs.length > 0 &&
               (selectionMode ? (
                 <div className="flex items-center gap-2 px-1">
                   <Checkbox
                     checked={conversationHeaderChecked}
                     onCheckedChange={(checked) => toggleAllConversations(checked === true)}
-                    aria-label="选择全部对话"
+                    aria-label="选择当前筛选的全部对话"
+                    disabled={filteredConversations.length === 0 || bulkDeleting}
                   />
                   <span className="text-muted-foreground min-w-0 flex-1 text-xs tabular-nums">
-                    {selectedConversationCount > 0 ? `已选 ${selectedConversationCount} 个` : `共 ${convs.length} 个`}
+                    {selectedConversationCount > 0 ? `已选 ${selectedConversationCount} 个` : conversationCountLabel}
                   </span>
                   {selectedConversationCount > 0 && (
                     <Button
@@ -1146,13 +1407,14 @@ export default function ChatPage() {
               ) : (
                 <div className="flex items-center gap-2 px-1">
                   <span className="text-muted-foreground min-w-0 flex-1 text-xs tabular-nums">
-                    共 {convs.length} 个
+                    {conversationCountLabel}
                   </span>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="text-muted-foreground"
                     onClick={() => setSelectionMode(true)}
+                    disabled={filteredConversations.length === 0}
                   >
                     <ListChecksIcon data-icon="inline-start" />
                     多选
@@ -1160,10 +1422,18 @@ export default function ChatPage() {
                 </div>
               ))}
           </div>
-          <ScrollArea type="auto" className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!">
+          <ScrollArea
+            key={agentFilter === null ? "all" : `agent:${agentFilter}`}
+            type="auto"
+            className="min-h-0 min-w-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:block!"
+          >
             <div className="flex min-w-0 flex-col gap-0.5 p-2">
-              {convs.length === 0 && <p className="text-muted-foreground px-2 py-6 text-center text-xs">暂无对话</p>}
-              {visibleConversations.map((c) => (
+              {filteredConversations.length === 0 && (
+                <p className="text-muted-foreground px-2 py-6 text-center text-xs">
+                  {agentFilter === null ? "暂无对话" : "该 Agent 暂无对话"}
+                </p>
+              )}
+              {pinnedConversations.map((c) => (
                 <ConversationItem
                   key={c.id}
                   conv={c}
@@ -1171,7 +1441,7 @@ export default function ChatPage() {
                   active={selectedId === c.id}
                   renaming={renamingId === c.id}
                   renameText={renamingId === c.id ? renameText : ""}
-                  onSelect={setSelectedId}
+                  onSelect={selectConversation}
                   onStartRename={startRename}
                   onRenameText={setRenameText}
                   onCommitRename={commitRename}
@@ -1183,7 +1453,42 @@ export default function ChatPage() {
                   onSelectedForDeleteChange={toggleConversationSelected}
                 />
               ))}
-              {visibleConversationCount < convs.length && (
+              {agentGroups.map((group) => {
+                const collapsed = collapsedAgents.has(group.key);
+                return (
+                  <React.Fragment key={group.key}>
+                    <AgentGroupHeader
+                      group={group}
+                      collapsed={collapsed}
+                      hasActive={group.conversations.some((c) => c.id === selectedId)}
+                      onToggle={toggleAgentCollapsed}
+                    />
+                    {!collapsed &&
+                      group.conversations.map((c) => (
+                        <ConversationItem
+                          key={c.id}
+                          conv={c}
+                          agent={agentByKey.get(c.agent_key)}
+                          showAgent={false}
+                          active={selectedId === c.id}
+                          renaming={renamingId === c.id}
+                          renameText={renamingId === c.id ? renameText : ""}
+                          onSelect={selectConversation}
+                          onStartRename={startRename}
+                          onRenameText={setRenameText}
+                          onCommitRename={commitRename}
+                          onCancelRename={cancelRename}
+                          onTogglePinned={togglePinned}
+                          onDelete={del}
+                          selectionMode={selectionMode}
+                          selectedForDelete={selectedConversationIds.has(c.id)}
+                          onSelectedForDeleteChange={toggleConversationSelected}
+                        />
+                      ))}
+                  </React.Fragment>
+                );
+              })}
+              {visibleConversationCount < filteredConversations.length && (
                 <Button
                   type="button"
                   variant="ghost"
@@ -1210,11 +1515,16 @@ export default function ChatPage() {
               onTitleMaybeChanged={reloadConvs}
               onConvUpdated={reloadConvs}
             />
+          ) : sourceRequested ? (
+            <div role="status" className="p-6 text-sm text-muted-foreground">
+              {convsLoaded ? "对话已被删除" : "正在加载对应对话…"}
+            </div>
           ) : (
             <DraftChat
               agents={chatAgents}
               profiles={profiles}
               onStarted={(c, pending) => {
+                if (agentFilter !== null && agentFilter !== c.agent_key) changeAgentFilter(null);
                 // Insert the new conversation immediately so `selected` resolves to
                 // it on this render (switching to ChatView right away, before the
                 // async reloadConvs lands); reloadConvs then reconciles titles etc.
@@ -1226,7 +1536,7 @@ export default function ChatPage() {
                   return [...prev.slice(0, insertAt), c, ...prev.slice(insertAt)];
                 });
                 setSelectedId(c.id);
-                reloadConvs();
+                void reloadConvs();
               }}
             />
           )}

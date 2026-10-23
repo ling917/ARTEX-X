@@ -96,9 +96,6 @@ type Engine struct {
 
 	bc *Broadcaster // live activity pub/sub (SSE)
 
-	mu       sync.RWMutex
-	planner  *agent.Planner
-	worker   *agent.Worker
 	started  sync.Map // taskID -> bool, so Run is idempotent per task
 	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
 	llmCalls sync.Map // taskID -> *int64, actual planner/worker/main-agent LLM calls
@@ -146,11 +143,14 @@ type Engine struct {
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
 	coordStarted sync.Map // taskID -> bool, deadline 协调器是否已启动(Run/reload 去重)
 
-	// resolve, if set, returns a task's dedicated planner/worker. In legacy mode
-	// nil,nil falls back to the global pair; an authoritative resolver uses nil,nil
-	// to mean this task is deliberately unavailable (for example an exhausted chain).
+	// resolve returns a task's dedicated planner/worker (wired by the server as the
+	// authoritative task-router). nil,nil means this task is deliberately unavailable
+	// (for example an exhausted failover chain) — there is no global-pair fallback.
 	resolve              func(t *Task) (*agent.Planner, *agent.Worker)
 	resolveAuthoritative bool
+	// readiness reports whether a global LLM provider is configured — the signal behind
+	// Ready()/the llm_configured indicator. Wired once at startup; nil → not ready.
+	readiness func() bool
 }
 
 type taskRuntime struct {
@@ -527,9 +527,52 @@ func (e *Engine) drainSteer(intentID int64) (string, bool) {
 // before each tool call it drains a queued course-correction (if any) and blocks the
 // call, handing the message back to the model — which re-plans its next step instead
 // of running the tool. No queued message → the guard behaves exactly as before.
+// 它同时负责「空转回合」的续跑，见 Stop。
 type steerHooks struct {
 	inner harness.HookRunner
 	drain func() (string, bool)
+	// nudges 是本条意图已注入的空转续跑次数，上限 limit。指针:harness 持有的是
+	// steerHooks 的值拷贝，计数必须共享同一份。
+	nudges *atomic.Int64
+	// limit 是空转续跑的次数上限，由 Engine.emptyTurnNudgeLimit() 从「空响应重试
+	// 次数」解析而来。<=0 = 不介入(用户显式关掉了这层)。
+	limit int
+	// label 形如 "worker-1 · #42"，只用于日志。
+	label string
+}
+
+// 空转回合(只有思考、既无正文也无工具调用)续跑次数的默认值，与 SDK 空响应重试的
+// 内置默认(norma/llm/openai.go 的 emptyResponseRetries)保持一致——两层共用同一个
+// 旋钮，不配置时的行为也该对齐。解析见 Engine.emptyTurnNudgeLimit。
+//
+// 注意这个数是「一条意图的总量」，不是「连续几次」:harness 自身的 stopHookActive
+// 已经限死了连续空转只推一次——推完那一轮若还是空转，Stop 钩子不会再被调到，run 直接
+// 收场;只有真正发生过一次工具回合，配额才刷新(norma/harness/query.go:534)。所以这个
+// 闸挡的是「工具 → 空转 → 推 → 工具 → 空转」这种病态循环，别让它把意图预算耗光。
+const defaultEmptyTurnNudges = 2
+
+// emptyTurnNudge 是空转回合注入的续跑指令。
+//
+// 这种回合在 harness 眼里是一次自然结束(stop_reason=end_turn 且无 tool_use)，五层
+// LLM 重试一层都不适用——它不是错误，是模型「想完了但没动手」。SDK 的空响应重试也
+// 够不着:它以「有没有 yield 过事件」判空，而思考增量本身就是事件(norma/llm/openai.go
+// 的 SEThinkingDelta)，所以 thinking-only 不算空。何况那层是原样重发整个 prompt，
+// 对这种由上下文形状决定的空转，重发只会让模型再想一遍。这里换成追加一条指令，让它
+// 带着已经产出的思考继续，输入变了才有理由给出不同的行为。
+const emptyTurnNudge = "【空转提醒】你上一轮只输出了思考过程，既没有给出正文回复，也没有调用任何工具，" +
+	"这一轮等于没有产出。请直接执行你刚才想好的下一步：要么调用工具，要么给出结论文字。不要重复思考。"
+
+// isThinkingOnlyTurn reports whether the latest assistant turn produced neither
+// text nor a tool call — i.e. the model spent the whole round thinking.
+func isThinkingOnlyTurn(messages []llm.Message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Role != llm.RoleAssistant {
+			continue
+		}
+		return strings.TrimSpace(m.Text()) == "" && len(m.ToolUses()) == 0
+	}
+	return false
 }
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
@@ -549,11 +592,31 @@ func (h steerHooks) PostToolUse(ctx context.Context, name string, input, result 
 	}
 }
 
+// Stop 在 guard 原有语义之上补一层「空转回合」续跑:模型只输出了思考、既没给正文
+// 也没调工具时，harness 会把它当成自然结束并以空 summary 收场(query.go 的
+// ReasonCompleted + asst.Text())，一条本来还没做完的意图就这样断在半路。此时注入
+// 一条续跑指令，让模型带着已有思考接着走。
 func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []string, string) {
+	var (
+		prevent  bool
+		blocking []string
+		msg      string
+	)
 	if h.inner != nil {
-		return h.inner.Stop(ctx, messages)
+		prevent, blocking, msg = h.inner.Stop(ctx, messages)
 	}
-	return false, nil, ""
+	// inner 已经决定硬停、或已经要注入自己的续跑消息 → 尊重它，不再叠加。
+	// limit<=0 = 用户把「空响应重试次数」配成了 -1，即显式关掉这层。
+	if prevent || len(blocking) > 0 || h.nudges == nil || h.limit <= 0 || !isThinkingOnlyTurn(messages) {
+		return prevent, blocking, msg
+	}
+	n := h.nudges.Add(1)
+	if n > int64(h.limit) {
+		log.Printf("[work %s] 空转回合(仅思考、无正文无工具)已达续跑上限 %d，放行收场", h.label, h.limit)
+		return prevent, blocking, msg
+	}
+	log.Printf("[work %s] 空转回合(仅思考、无正文无工具)，注入续跑指令 (%d/%d)", h.label, n, h.limit)
+	return false, []string{emptyTurnNudge}, ""
 }
 
 // KillWork cancels the in-flight work running intentID (planner's kill_work tool).
@@ -633,18 +696,9 @@ func (e *Engine) appendActivity(t *Task, r db.Activity) (int64, error) {
 	return 0, err
 }
 
-// UseLLM installs (or replaces) the LLM planner + work agent at runtime.
-func (e *Engine) UseLLM(p *agent.Planner, w *agent.Worker) {
-	e.mu.Lock()
-	e.planner, e.worker = p, w
-	e.mu.Unlock()
-}
-
-func (e *Engine) snapshot() (*agent.Planner, *agent.Worker) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.planner, e.worker
-}
+// SetReadiness wires the global "an LLM provider is configured" predicate (read by
+// Ready() / the llm_configured indicator). Called once at startup.
+func (e *Engine) SetReadiness(fn func() bool) { e.readiness = fn }
 
 // SetAgentResolver installs a per-task planner/worker resolver (wired by the server).
 // Called once at startup before any task loop runs, so no lock is needed on reads.
@@ -661,9 +715,9 @@ func (e *Engine) SetAuthoritativeAgentResolver(fn func(t *Task) (*agent.Planner,
 	e.resolveAuthoritative = true
 }
 
-// snapshotFor returns the planner/worker a task should run on: the task's dedicated
-// pair when it pins a specific LLM profile (via the resolver), else the global active
-// pair. The resolver returning nil means "no override" (fall back to global).
+// snapshotFor returns the planner/worker a task should run on, from the task-router
+// resolver. nil,nil means the task is deliberately unavailable (e.g. an exhausted
+// failover chain); there is no global-pair fallback.
 func (e *Engine) snapshotFor(t *Task) (*agent.Planner, *agent.Worker) {
 	if e.resolve != nil {
 		p, w := e.resolve(t)
@@ -671,13 +725,13 @@ func (e *Engine) snapshotFor(t *Task) (*agent.Planner, *agent.Worker) {
 			return p, w
 		}
 	}
-	return e.snapshot()
+	return nil, nil
 }
 
-// Ready reports whether an LLM provider is configured.
+// Ready reports whether a global LLM provider is configured (via the readiness
+// predicate wired at startup).
 func (e *Engine) Ready() bool {
-	p, w := e.snapshot()
-	return p != nil && w != nil
+	return e.readiness != nil && e.readiness()
 }
 
 // ReadyFor reports whether a specific task can resolve a planner/worker pair.
@@ -686,14 +740,6 @@ func (e *Engine) Ready() bool {
 func (e *Engine) ReadyFor(t *Task) bool {
 	p, w := e.snapshotFor(t)
 	return p != nil && w != nil
-}
-
-// Mode reports "llm" when ready, else "idle".
-func (e *Engine) Mode() string {
-	if e.Ready() {
-		return "llm"
-	}
-	return "idle"
 }
 
 // Run starts the planner loop + N worker loops for a task. The loops always run
@@ -956,8 +1002,17 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		a.NodeID, a.Worker = &nid, name
 		emit(a)
 	}
-	workCtx = intercept.WithTaskContext(workCtx, t.ID, fmt.Sprintf("%s · #%d", name, iid), taskEmit)
-	hooks := steerHooks{inner: t.Guard.Hooks(), drain: func() (string, bool) { return e.drainSteer(iid) }}
+	label := fmt.Sprintf("%s · #%d", name, iid)
+	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
+	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
+	// 重跑一轮不该把额度清零重来。
+	hooks := steerHooks{
+		inner:  t.Guard.Hooks(),
+		drain:  func() (string, bool) { return e.drainSteer(iid) },
+		nudges: &atomic.Int64{},
+		limit:  e.emptyTurnNudgeLimit(),
+		label:  label,
+	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
@@ -972,12 +1027,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
 	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
-	for attempt := 1; attempt <= modelErrorRetries &&
+	maxRetries, retryBackoff := e.modelErrorRetryPolicy()
+	for attempt := 1; attempt <= maxRetries &&
 		retryableWorkerModelError(reason, err) &&
 		workCtx.Err() == nil && ectx.Err() == nil && !e.IsPaused(t.ID) && !e.isSettling(t.ID); attempt++ {
 		log.Printf("[worker %s] task %s 意图 #%d model_error 收场，%v 后重试 (%d/%d)",
-			name, t.ID, intent.ID, modelErrorRetryBackoff, attempt, modelErrorRetries)
-		if sleepCtx(workCtx, modelErrorRetryBackoff) {
+			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
+		if sleepCtx(workCtx, retryBackoff) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
 		}
 		e.BeginLLMCall(t.ID)
@@ -1112,7 +1168,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 // server root, never the HTTP request, so a disconnect cannot strand the run while
 // task pause/delete/shutdown still stops it). Returns an error if the run could not
 // be started; the intent is left untouched in that case.
-func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message string) error {
+func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message, agentMessage string) error {
 	if !e.beginTaskOperation(t.ID) {
 		return fmt.Errorf("task is being deleted")
 	}
@@ -1143,14 +1199,14 @@ func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64,
 	node.State, node.Owner = "running", "chat"
 	// Record the human turn as a visible activity BEFORE the run starts, so it is
 	// ordered ahead of any worker step and never appears without the run happening.
-	// This is the UI copy; ExecuteWithMessage separately writes it into the intent
-	// transcript as the LLM input.
+	// Keep the UI copy concise; ExecuteWithMessage writes the server-resolved
+	// reference snapshot into the intent transcript as the LLM input.
 	uid := intentID
 	e.emitActivity(t, db.Activity{NodeID: &uid, Worker: "user", Kind: "user", Summary: message, Detail: message})
 	release = false // ownership of the admission passes to the goroutine
 	go func() {
 		defer e.decInflight(t.ID)
-		e.runIntent(ctx, t, "chat", worker, node, requestID, message)
+		e.runIntent(ctx, t, "chat", worker, node, requestID, agentMessage)
 	}()
 	return nil
 }

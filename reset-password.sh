@@ -6,19 +6,14 @@
 # auth.password_hash 键。本脚本连上数据库后，用 pgcrypto 在库内生成 bcrypt 哈希
 # 并写回该键——与后端登录校验（golang.org/x/crypto/bcrypt）完全兼容。
 #
-# 两种部署：
-#   local （默认）—— 宿主机直接用 psql 连数据库。连接信息按以下优先级获取：
-#                    命令行参数 > --dsn/$ARTEX_PG_DSN > config.json 的 database.*
-#   docker        —— 通过 `docker compose exec`（或 `docker exec`）在 postgres
-#                    容器内执行 psql（compose 默认不对宿主暴露 5432，故走容器内）。
+# 使用本机 psql（postgresql-client）直连数据库。连接信息按以下优先级获取：
+#   命令行参数 > --dsn/$ARTEX_PG_DSN > config.json 的 database.*
 #
 # 用法示例：
-#   ./reset-password.sh                          # 本地，自动读 config.json/环境，交互输入新密码
-#   ./reset-password.sh -p 'NewPass!'            # 本地，直接给定新密码
+#   ./reset-password.sh                          # 自动读 config.json/环境，交互输入新密码
+#   ./reset-password.sh -p 'NewPass!'            # 直接给定新密码
 #   ./reset-password.sh --dsn postgres://u:p@h:5432/artex
 #   ./reset-password.sh -H 127.0.0.1 -P 5433 -U autopentest -W pass -d artex
-#   ./reset-password.sh -m docker                # docker 部署（读 .env 的 POSTGRES_*）
-#   ./reset-password.sh -m docker -c pg容器名 --exec docker
 #
 # 安全：新密码经环境变量 + psql \getenv 传入（不进入进程 argv），并用 :'var'
 # 自动转义（防 SQL 注入）；数据库密码经 PGPASSWORD 传递，同样不进 argv。
@@ -28,24 +23,36 @@ set -euo pipefail
 PASS_KEY="auth.password_hash"
 BCRYPT_COST=10
 
-MODE=""            # local | docker（空=自动判定）
 DSN=""
 HOST="" PORT="" USER="" DBPASS="" DBNAME="" SSLMODE=""
 CONFIG=""
-CONTAINER=""       # docker 模式的 postgres 服务/容器名（默认 postgres）
-EXEC_KIND=""       # compose | docker（docker 模式下用哪种 exec；空=自动）
 NEWPASS=""
 ASSUME_YES=0
 
 die() { echo "错误：$*" >&2; exit 1; }
 info() { echo "· $*" >&2; }
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() {
+  cat >&2 <<'EOF'
+用法: ./reset-password.sh [选项]
+  -p, --new-password <pw>   新密码（省略则交互输入）
+      --dsn <dsn>           PostgreSQL DSN
+  -H, --host <host>         数据库地址（默认 127.0.0.1）
+  -P, --port <port>         数据库端口（默认 5432）
+  -U, --user <user>         数据库用户
+  -W, --db-password <pw>    数据库密码
+  -d, --dbname <name>       数据库名
+      --sslmode <mode>      sslmode（默认 disable）
+      --config <path>       config.json 路径（默认 ./config.json）
+  -y, --yes                 跳过确认
+  -h, --help                显示本帮助
+EOF
+  exit 0
+}
 
 # ---- 参数解析 -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -m|--mode)        MODE="${2:-}"; shift 2 ;;
     --dsn)            DSN="${2:-}"; shift 2 ;;
     -H|--host)        HOST="${2:-}"; shift 2 ;;
     -P|--port)        PORT="${2:-}"; shift 2 ;;
@@ -54,8 +61,6 @@ while [[ $# -gt 0 ]]; do
     -d|--dbname)      DBNAME="${2:-}"; shift 2 ;;
     --sslmode)        SSLMODE="${2:-}"; shift 2 ;;
     --config)         CONFIG="${2:-}"; shift 2 ;;
-    -c|--container)   CONTAINER="${2:-}"; shift 2 ;;
-    --exec)           EXEC_KIND="${2:-}"; shift 2 ;;
     -p|--new-password) NEWPASS="${2:-}"; shift 2 ;;
     -y|--yes)         ASSUME_YES=1; shift ;;
     -h|--help)        usage ;;
@@ -63,7 +68,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---- 从 config.json 读取 database.*（仅 local 模式、且未显式给出连接时）-----
+# ---- 从 config.json 读取 database.*（未显式给出连接时）-----
 # 优先用 python3 解析（健壮）；缺 python3 时退回 grep（config.json 为规整分字段）。
 read_config_json() {
   local path="$1"
@@ -110,18 +115,6 @@ apply_config_fields() {
   done
 }
 
-# ---- 自动判定模式 ---------------------------------------------------------
-if [[ -z "$MODE" ]]; then
-  if [[ -n "$DSN$HOST$USER$DBNAME" || -n "${ARTEX_PG_DSN:-}" || -f "${CONFIG:-config.json}" ]]; then
-    MODE="local"
-  elif command -v docker >/dev/null 2>&1 && [[ -f docker-compose.yml ]]; then
-    MODE="docker"
-  else
-    MODE="local"
-  fi
-fi
-info "部署模式：$MODE"
-
 # ---- 采集新密码 -----------------------------------------------------------
 if [[ -z "$NEWPASS" ]]; then
   read -r -s -p "输入新密码（用户名固定为 ARTEX）：" NEWPASS; echo >&2
@@ -135,7 +128,7 @@ fi
 export ARTEX_RESET_NEWPASS="$NEWPASS"
 
 # 库内生成 bcrypt 并 upsert；密码用 :'newpw' 自动转义。CREATE EXTENSION 幂等，
-# 若数据库角色无建扩展权限会在此报错（提示见下方 run 的失败分支）。
+# 若数据库角色无建扩展权限会在此报错（提示见下方失败分支）。
 SQL=$(cat <<SQL
 \\set ON_ERROR_STOP on
 \\getenv newpw ARTEX_RESET_NEWPASS
@@ -147,88 +140,42 @@ SQL
 )
 
 # ---- 执行 -----------------------------------------------------------------
-if [[ "$MODE" == "local" ]]; then
-  # 连接信息优先级：命令行 > --dsn/$ARTEX_PG_DSN > config.json
-  if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
-    [[ -n "${ARTEX_PG_DSN:-}" ]] && DSN="$ARTEX_PG_DSN"
+# 连接信息优先级：命令行 > --dsn/$ARTEX_PG_DSN > config.json
+if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
+  [[ -n "${ARTEX_PG_DSN:-}" ]] && DSN="$ARTEX_PG_DSN"
+fi
+if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
+  cfg="${CONFIG:-config.json}"
+  if [[ -f "$cfg" ]]; then
+    info "从 $cfg 读取数据库配置"
+    apply_config_fields < <(read_config_json "$cfg")
   fi
-  if [[ -z "$DSN" && -z "$HOST$USER$DBNAME" ]]; then
-    cfg="${CONFIG:-config.json}"
-    if [[ -f "$cfg" ]]; then
-      info "从 $cfg 读取数据库配置"
-      apply_config_fields < <(read_config_json "$cfg")
-    fi
-  fi
+fi
 
-  command -v psql >/dev/null 2>&1 || die "本机未找到 psql（请安装 postgresql-client，或改用 -m docker）"
+command -v psql >/dev/null 2>&1 || die "本机未找到 psql，请先安装 postgresql-client"
 
-  declare -a PSQL_ARGS=()
-  if [[ -n "$DSN" ]]; then
-    PSQL_ARGS=("$DSN")
-    target="$DSN"
-  else
-    [[ -n "$USER"   ]] || die "缺少数据库用户（-U）或有效的 config.json/DSN"
-    [[ -n "$DBNAME" ]] || die "缺少数据库名（-d）或有效的 config.json/DSN"
-    HOST="${HOST:-127.0.0.1}"; PORT="${PORT:-5432}"; SSLMODE="${SSLMODE:-disable}"
-    PSQL_ARGS=(-h "$HOST" -p "$PORT" -U "$USER" -d "$DBNAME")
-    [[ -n "$SSLMODE" ]] && export PGSSLMODE="$SSLMODE"
-    [[ -n "$DBPASS" ]] && export PGPASSWORD="$DBPASS"
-    target="$USER@$HOST:$PORT/$DBNAME"
-  fi
-
-  info "目标数据库：$target"
-  if [[ "$ASSUME_YES" -ne 1 ]]; then
-    read -r -p "确认在该库重置 ARTEX 密码？[y/N] " ans
-    [[ "$ans" == "y" || "$ans" == "Y" ]] || die "已取消"
-  fi
-
-  if ! printf '%s\n' "$SQL" | psql "${PSQL_ARGS[@]}" -v ON_ERROR_STOP=1 -q >/dev/null; then
-    die "写入失败。若报 pgcrypto 权限/缺失，请用具备建扩展权限的角色，或先手动执行 CREATE EXTENSION pgcrypto。"
-  fi
-
+declare -a PSQL_ARGS=()
+if [[ -n "$DSN" ]]; then
+  PSQL_ARGS=("$DSN")
+  target="$DSN"
 else
-  # ---- docker ----
-  command -v docker >/dev/null 2>&1 || die "未找到 docker"
-  CONTAINER="${CONTAINER:-postgres}"
-
-  # 选择 exec 方式：优先 docker compose exec（服务名），否则 docker exec（容器名）
-  if [[ -z "$EXEC_KIND" ]]; then
-    if docker compose version >/dev/null 2>&1 && [[ -f docker-compose.yml ]]; then
-      EXEC_KIND="compose"
-    else
-      EXEC_KIND="docker"
-    fi
-  fi
-
-  # 容器内的 psql 凭据：优先命令行，其次 .env 的 POSTGRES_*，再退回 compose 默认(artex)
-  if [[ -f .env ]]; then
-    # shellcheck disable=SC1091
-    set -a; . ./.env; set +a
-  fi
-  DUSER="${USER:-${POSTGRES_USER:-artex}}"
-  DNAME="${DBNAME:-${POSTGRES_DB:-artex}}"
+  [[ -n "$USER"   ]] || die "缺少数据库用户（-U）或有效的 config.json/DSN"
+  [[ -n "$DBNAME" ]] || die "缺少数据库名（-d）或有效的 config.json/DSN"
+  HOST="${HOST:-127.0.0.1}"; PORT="${PORT:-5432}"; SSLMODE="${SSLMODE:-disable}"
+  PSQL_ARGS=(-h "$HOST" -p "$PORT" -U "$USER" -d "$DBNAME")
+  [[ -n "$SSLMODE" ]] && export PGSSLMODE="$SSLMODE"
   [[ -n "$DBPASS" ]] && export PGPASSWORD="$DBPASS"
-  [[ -z "${PGPASSWORD:-}" && -n "${POSTGRES_PASSWORD:-}" ]] && export PGPASSWORD="$POSTGRES_PASSWORD"
+  target="$USER@$HOST:$PORT/$DBNAME"
+fi
 
-  info "目标：容器 $CONTAINER 内 psql -U $DUSER -d $DNAME（exec=$EXEC_KIND）"
-  if [[ "$ASSUME_YES" -ne 1 ]]; then
-    read -r -p "确认在该容器数据库重置 ARTEX 密码？[y/N] " ans
-    [[ "$ans" == "y" || "$ans" == "Y" ]] || die "已取消"
-  fi
+info "目标数据库：$target"
+if [[ "$ASSUME_YES" -ne 1 ]]; then
+  read -r -p "确认在该库重置 ARTEX 密码？[y/N] " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || die "已取消"
+fi
 
-  # -e 只带名字不带值 → 从当前环境继承，密码不出现在 docker 命令 argv 里。
-  declare -a EXEC_CMD
-  if [[ "$EXEC_KIND" == "compose" ]]; then
-    EXEC_CMD=(docker compose exec -T -e ARTEX_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
-              psql -U "$DUSER" -d "$DNAME" -v ON_ERROR_STOP=1 -q)
-  else
-    EXEC_CMD=(docker exec -i -e ARTEX_RESET_NEWPASS -e PGPASSWORD "$CONTAINER"
-              psql -U "$DUSER" -d "$DNAME" -v ON_ERROR_STOP=1 -q)
-  fi
-
-  if ! printf '%s\n' "$SQL" | "${EXEC_CMD[@]}" >/dev/null; then
-    die "写入失败。请确认容器名（-c）、数据库账号（.env 的 POSTGRES_*），以及角色有 pgcrypto 权限。"
-  fi
+if ! printf '%s\n' "$SQL" | psql "${PSQL_ARGS[@]}" -v ON_ERROR_STOP=1 -q >/dev/null; then
+  die "写入失败。若报 pgcrypto 权限/缺失，请用具备建扩展权限的角色，或先手动执行 CREATE EXTENSION pgcrypto。"
 fi
 
 unset ARTEX_RESET_NEWPASS

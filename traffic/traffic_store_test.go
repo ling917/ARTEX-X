@@ -360,7 +360,7 @@ func TestPageSearchesBodies(t *testing.T) {
 	tr.record(newFlow("api.example.com", "POST", "/v1/login", nil, []byte(`{"error":"invalid credentials"}`)))
 	tr.record(newFlow("api.example.com", "GET", "/v1/health", nil, []byte(`{"status":"ok"}`)))
 
-	rows, total, err := tr.Page("", "", "invalid credentials", 0, 100)
+	rows, total, err := tr.Page(PageQuery{Query: "invalid credentials", RespMin: -1, RespMax: -1}, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,8 +368,96 @@ func TestPageSearchesBodies(t *testing.T) {
 		t.Fatalf("正文关键词命中 total=%d rows=%d，应为 1/1", total, len(rows))
 	}
 	// Metadata matching still works alongside it.
-	if _, total, err := tr.Page("", "", "health", 0, 100); err != nil || total != 1 {
+	if _, total, err := tr.Page(PageQuery{Query: "health", RespMin: -1, RespMax: -1}, 0, 100); err != nil || total != 1 {
 		t.Fatalf("URL 关键词 total=%d err=%v，应为 1", total, err)
+	}
+}
+
+// TestPageFiltersAndSort covers the issue #177 additions: status-class/exact
+// filtering, response-size bounds, path (url_template) filtering, and
+// server-side sorting by resp_len.
+func TestPageFiltersAndSort(t *testing.T) {
+	tr, _ := openTraffic(t)
+	status := func(code int) flowOpt { return func(f *mproxy.Flow) { f.Response.StatusCode = code } }
+	// Three exchanges with distinct status codes and response sizes.
+	tr.record(newFlow("api.example.com", "GET", "/api/users", nil, make([]byte, 10), status(200)))
+	tr.record(newFlow("api.example.com", "GET", "/api/admin", nil, make([]byte, 100), status(404)))
+	tr.record(newFlow("api.example.com", "GET", "/api/users/1", nil, make([]byte, 50), status(500)))
+
+	// Status class band.
+	if rows, _, err := tr.Page(PageQuery{Status: "4xx", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
+		t.Fatalf("status=4xx 应命中 1 条 404，得 %d 条 err=%v", len(rows), err)
+	}
+	// Exact status.
+	if rows, _, err := tr.Page(PageQuery{Status: "500", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 500 {
+		t.Fatalf("status=500 应命中 1 条，得 %d 条 err=%v", len(rows), err)
+	}
+	// Response-size lower bound (>=60 keeps only the 100-byte row).
+	if rows, _, err := tr.Page(PageQuery{RespMin: 60, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].RespLen != 100 {
+		t.Fatalf("resp_min=60 应命中 1 条 100B，得 %d 条 err=%v", len(rows), err)
+	}
+	// Path (url_template) filter narrows to the /api/admin exchange.
+	if rows, _, err := tr.Page(PageQuery{Path: "/api/admin", RespMin: -1, RespMax: -1}, 0, 100); err != nil || len(rows) != 1 || rows[0].Status != 404 {
+		t.Fatalf("path=/api/admin 应命中 1 条，得 %d 条 err=%v", len(rows), err)
+	}
+	// Sort by response length, ascending then descending.
+	asc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "asc"}, 0, 100)
+	if err != nil || len(asc) != 3 {
+		t.Fatalf("resp_len asc 应返回 3 条，得 %d 条 err=%v", len(asc), err)
+	}
+	if asc[0].RespLen != 10 || asc[1].RespLen != 50 || asc[2].RespLen != 100 {
+		t.Fatalf("resp_len asc 顺序错误：%d,%d,%d", asc[0].RespLen, asc[1].RespLen, asc[2].RespLen)
+	}
+	desc, _, err := tr.Page(PageQuery{RespMin: -1, RespMax: -1, Sort: "resp_len", Order: "desc"}, 0, 100)
+	if err != nil || len(desc) != 3 || desc[0].RespLen != 100 || desc[2].RespLen != 10 {
+		t.Fatalf("resp_len desc 顺序错误 err=%v", err)
+	}
+}
+
+func TestQueryHostPortAndURLForms(t *testing.T) {
+	tr, _ := openTraffic(t)
+	tr.record(newFlow("api.example.com:8082", "GET", "/admin", nil, []byte("8082")))
+	tr.record(newFlow("api.example.com:8088", "GET", "/admin", nil, []byte("8088")))
+	tr.record(newFlow("[2001:db8::1]:8443", "GET", "/admin", nil, []byte("8443")))
+
+	for _, tc := range []struct {
+		name string
+		host string
+		want int
+	}{
+		{name: "bare host", host: "api.example.com", want: 2},
+		{name: "host and port", host: "api.example.com:8082", want: 1},
+		{name: "full URL", host: "http://api.example.com:8088/admin", want: 1},
+		{name: "IPv6 host and port", host: "[2001:db8::1]:8443", want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows, err := tr.query(tc.host, "", "", 0, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != tc.want {
+				t.Fatalf("query(%q) returned %d rows, want %d", tc.host, len(rows), tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeSearchHost(t *testing.T) {
+	for _, tc := range []struct {
+		raw, host, port string
+	}{
+		{raw: "API.Example.com", host: "api.example.com"},
+		{raw: "api.example.com:8088", host: "api.example.com", port: "8088"},
+		{raw: "https://[2001:db8::1]:8443/path", host: "2001:db8::1", port: "8443"},
+		{raw: "[2001:db8::1]", host: "2001:db8::1"},
+	} {
+		host, port, err := normalizeSearchHost(tc.raw)
+		if err != nil {
+			t.Fatalf("normalizeSearchHost(%q): %v", tc.raw, err)
+		}
+		if host != tc.host || port != tc.port {
+			t.Fatalf("normalizeSearchHost(%q)=(%q,%q), want (%q,%q)", tc.raw, host, port, tc.host, tc.port)
+		}
 	}
 }
 

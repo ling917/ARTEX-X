@@ -159,6 +159,10 @@ CREATE TABLE IF NOT EXISTS explorations (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- cold-digest (§2.3): per-task planner round counter — bumped once each time the
+-- planner wakes and processes a round. Drives the ≥R cold-node debounce (measured in
+-- this exploration's own rounds, not global node ids or wall-clock).
+ALTER TABLE explorations ADD COLUMN IF NOT EXISTS round_no BIGINT NOT NULL DEFAULT 0;
 DROP TRIGGER IF EXISTS trg_exp_upd ON explorations;
 CREATE TRIGGER trg_exp_upd BEFORE UPDATE ON explorations
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -173,36 +177,64 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
     origin         TEXT,
     owner          TEXT,
     blocked_reason TEXT,
+    delete_reason  TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at   TIMESTAMPTZ,
-    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint')),
+    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest')),
     CONSTRAINT ck_node_state CHECK (
         (kind='begin'   AND state IN ('open')) OR
-        (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped')) OR
+        (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped','deleted')) OR
         (kind='goal'    AND state IN ('open','met','abandoned')) OR
         (kind='fact'    AND state IN ('confirmed','dismissed','origin')) OR
         (kind='finding' AND state IN ('confirmed','dismissed')) OR
-        (kind='hint'    AND state IN ('active','consumed'))
+        (kind='hint'    AND state IN ('active','consumed')) OR
+        (kind='digest'  AND state IN ('active','superseded'))
     )
 );
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
+-- 意图假删除(soft delete):state='deleted' 时,delete_reason 记用户填写的删除原因。
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
+-- cold-digest (§2.3/§5.3): content_version bumps on any change that could alter a
+-- digest body (summary/state/confidence); cold_since_round stamps the planner round
+-- a node most recently went from "has a live downstream branch" to none (NULL = hot).
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS content_version  INT    NOT NULL DEFAULT 0;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS cold_since_round BIGINT;
+-- ck_node_kind: existing installs predate the 'digest' kind — recreate to allow it.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='exploration_nodes'::regclass
+          AND conname='ck_node_kind'
+          AND pg_get_constraintdef(oid) NOT LIKE '%digest%'
+    ) THEN
+        ALTER TABLE exploration_nodes DROP CONSTRAINT ck_node_kind;
+        ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_kind
+            CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest'));
+    END IF;
+END $$;
+-- ck_node_state: recreate when it lacks the 'paused' (older), 'superseded' (digest rev),
+-- or 'deleted' (intent soft-delete rev) branches.
 DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid='exploration_nodes'::regclass
           AND conname='ck_node_state'
-          AND pg_get_constraintdef(oid) NOT LIKE '%paused%'
+          AND (pg_get_constraintdef(oid) NOT LIKE '%paused%'
+               OR pg_get_constraintdef(oid) NOT LIKE '%superseded%'
+               OR pg_get_constraintdef(oid) NOT LIKE '%deleted%')
     ) THEN
         ALTER TABLE exploration_nodes DROP CONSTRAINT ck_node_state;
         ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_state CHECK (
             (kind='begin'   AND state IN ('open')) OR
-            (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped')) OR
+            (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped','deleted')) OR
             (kind='goal'    AND state IN ('open','met','abandoned')) OR
             (kind='fact'    AND state IN ('confirmed','dismissed','origin')) OR
             (kind='finding' AND state IN ('confirmed','dismissed')) OR
-            (kind='hint'    AND state IN ('active','consumed'))
+            (kind='hint'    AND state IN ('active','consumed')) OR
+            (kind='digest'  AND state IN ('active','superseded'))
         );
     END IF;
 END $$;
@@ -217,13 +249,29 @@ CREATE TABLE IF NOT EXISTS exploration_edges (
     exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
     src_id         BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
     dst_id         BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
-    rel            TEXT NOT NULL CHECK (rel IN ('spawns','derived_from','yields','proves')),
+    rel            TEXT NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (exploration_id, src_id, rel, dst_id),
-    CONSTRAINT ck_edge_noself CHECK (src_id <> dst_id)
+    CONSTRAINT ck_edge_noself CHECK (src_id <> dst_id),
+    CONSTRAINT ck_edge_rel CHECK (rel IN ('spawns','derived_from','yields','proves','covers'))
 );
 CREATE INDEX IF NOT EXISTS idx_expedges_src ON exploration_edges(src_id, rel);
 CREATE INDEX IF NOT EXISTS idx_expedges_dst ON exploration_edges(dst_id, rel);
+-- cold-digest (§1): the 'covers' relation (digest→member) postdates shipped installs,
+-- whose rel CHECK is an inline auto-named constraint. Find and recreate it as ck_edge_rel.
+DO $$
+DECLARE cname text;
+BEGIN
+    SELECT conname INTO cname FROM pg_constraint
+     WHERE conrelid='exploration_edges'::regclass AND contype='c'
+       AND pg_get_constraintdef(oid) LIKE '%rel%'
+       AND pg_get_constraintdef(oid) NOT LIKE '%covers%';
+    IF cname IS NOT NULL THEN
+        EXECUTE 'ALTER TABLE exploration_edges DROP CONSTRAINT '||quote_ident(cname);
+        ALTER TABLE exploration_edges ADD CONSTRAINT ck_edge_rel
+            CHECK (rel IN ('spawns','derived_from','yields','proves','covers'));
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS exploration_anchors (
     node_id   BIGINT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
@@ -266,11 +314,22 @@ CREATE TABLE IF NOT EXISTS activity (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE activity ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';
+-- main_seg segments the main-agent session into resettable conversations: a new
+-- main session bumps the segment so its transcript + activity start clean while the
+-- task's graph/assets/goal are untouched. NULL == legacy rows == segment 0 (the
+-- original session). Only worker='mainagent' rows carry it.
+ALTER TABLE activity ADD COLUMN IF NOT EXISTS main_seg INTEGER;
 CREATE INDEX IF NOT EXISTS idx_act_node  ON activity(exploration_id, node_id, id);
 CREATE INDEX IF NOT EXISTS idx_act_since ON activity(exploration_id, id);
+CREATE INDEX IF NOT EXISTS idx_act_tool_call ON activity(exploration_id, tool_use_id, id)
+  WHERE kind IN ('tool_use', 'tool_result');
 -- Main/Plan history pages filter by worker (both carry NULL node_id, so idx_act_node
 -- can't distinguish them); this covers reverse pagination of those sessions.
 CREATE INDEX IF NOT EXISTS idx_act_worker ON activity(exploration_id, worker, id);
+-- Main-session pages filter by segment on top of worker='mainagent'; this partial
+-- index covers reverse pagination within one segment.
+CREATE INDEX IF NOT EXISTS idx_act_main_seg ON activity(exploration_id, main_seg, id)
+    WHERE worker='mainagent';
 -- Task-list polls aggregate result usage and find the latest event repeatedly.
 -- Cover the token columns for index-only aggregation and the timestamp order for
 -- per-exploration latest-activity lookups.
@@ -278,6 +337,18 @@ CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id)
     INCLUDE (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
     WHERE kind='result';
 CREATE INDEX IF NOT EXISTS idx_act_latest ON activity(exploration_id, created_at DESC);
+
+-- main_sessions records the resettable main-agent conversation segments of a task.
+-- Segment 0 (the original session) is implicit and never stored; this table holds
+-- only the extra segments created by "新建会话" (seq >= 1). The current segment is
+-- MAX(seq) or 0. Each segment gets its own transcript file + activity slice; the
+-- task's exploration graph/assets/goal are shared and never reset.
+CREATE TABLE IF NOT EXISTS main_sessions (
+    exploration_id BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
+    seq            INTEGER NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exploration_id, seq)
+);
 
 -- =====================================================================
 -- C. LLM profiles
@@ -324,6 +395,14 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- 自定义会话头：非空时每次请求带一个该名字的 HTTP 头，头值=当前运行的 session id
     -- (chat 会话/worker 意图)。用于某些按 session-id 头做提示缓存/粘性路由的网关。''=不发送。
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- 重试覆盖：次数 0=用全局默认/-1=关闭/>0=该值；间隔 0=用默认指数退避/>0=固定毫秒。
+    -- 三组分别对应建连重试、空响应重试、同 provider 安全窗口重试，详见下方 ALTER 处注释。
+    retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
+    retry_connect_interval_ms INTEGER NOT NULL DEFAULT 0,
+    retry_empty_attempts      INTEGER NOT NULL DEFAULT 0,
+    retry_empty_interval_ms   INTEGER NOT NULL DEFAULT 0,
+    retry_stream_attempts     INTEGER NOT NULL DEFAULT 0,
+    retry_stream_interval_ms  INTEGER NOT NULL DEFAULT 0,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -355,6 +434,24 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- 自定义会话头名；补旧库。默认 '' = 不发送，旧配置行为不变。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+
+-- 单配置的重试覆盖（见 docs/LLM重试设计.md）。三组各自一对「次数 + 固定间隔」，
+-- 语义统一：次数 0=沿用全局默认、-1=关闭该层重试、>0=用该值；间隔 0=沿用该层的
+-- 默认指数退避、>0=改用这个固定毫秒数。全部默认 0，所以旧库/旧配置行为不变。
+--   connect = 建连重试（SDK doStream：连接重置/超时/429/5xx，流开始前）
+--   empty   = 空响应重试（SDK：完成但没有任何 content block，仅 openai 格式）
+--   stream  = 同 provider 安全窗口重试（本项目 task_llm：未交付输出前的断流重放）
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_connect_attempts    INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_connect_interval_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_empty_attempts      INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_empty_interval_ms   INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_stream_attempts     INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS retry_stream_interval_ms  INTEGER NOT NULL DEFAULT 0;
+-- 同 format：先删再建，保证每次启动幂等。次数下限 -1(关闭)，间隔不能为负。
+ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_retry_check;
+ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_retry_check CHECK (
+    retry_connect_attempts >= -1 AND retry_empty_attempts >= -1 AND retry_stream_attempts >= -1
+    AND retry_connect_interval_ms >= 0 AND retry_empty_interval_ms >= 0 AND retry_stream_interval_ms >= 0);
 
 -- 思考开关字段 thinking_type，从旧的单一 reasoning_effort 语义一次性拆分而来。
 -- schema.sql 每次启动都执行，故迁移必须只跑一次：仅当该列尚不存在时才回填，
@@ -519,9 +616,16 @@ CREATE TABLE IF NOT EXISTS task_templates (
     nkey        TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL,
     goal        TEXT NOT NULL,
+    -- 预设的任务分类；分类删除时置空（与 tasks.category_id 一致，不阻断）。
+    category_id     BIGINT REFERENCES task_categories(id) ON DELETE SET NULL,
+    -- 预设的任务级拦截/允许规则快照(AssetInterceptRuleInput 数组)；应用模板时灌进新任务。
+    intercept_rules JSONB NOT NULL DEFAULT '[]',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 补旧库(已发版,加列带 IF NOT EXISTS)。
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL;
+ALTER TABLE task_templates ADD COLUMN IF NOT EXISTS intercept_rules JSONB NOT NULL DEFAULT '[]';
 CREATE INDEX IF NOT EXISTS idx_task_templates_updated ON task_templates(updated_at DESC, id DESC);
 DROP TRIGGER IF EXISTS trg_task_templates_upd ON task_templates;
 CREATE TRIGGER trg_task_templates_upd BEFORE UPDATE ON task_templates
@@ -729,15 +833,23 @@ CREATE TABLE IF NOT EXISTS agent_prompt_vars (
 CREATE TABLE IF NOT EXISTS mcp_servers (
     id          BIGSERIAL PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
-    transport   TEXT NOT NULL CHECK (transport IN ('stdio','http')),
+    transport   TEXT NOT NULL CHECK (transport IN ('stdio','http','sse')),
     command     TEXT,
     args        JSONB NOT NULL DEFAULT '[]',
     env         JSONB NOT NULL DEFAULT '{}',
     url         TEXT,
     enabled     BOOLEAN NOT NULL DEFAULT true,
+    insecure    BOOLEAN NOT NULL DEFAULT false,  -- http: 跳过 TLS 证书校验(自签证书场景, issue #108)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Allow legacy MCP SSE servers on databases created before SSE support.
+ALTER TABLE mcp_servers DROP CONSTRAINT IF EXISTS mcp_servers_transport_check;
+ALTER TABLE mcp_servers ADD CONSTRAINT mcp_servers_transport_check
+    CHECK (transport IN ('stdio','http','sse'));
+-- 旧库补列(schema.sql 每次启动都会 Exec)。
+ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS insecure BOOLEAN NOT NULL DEFAULT false;
 DROP TRIGGER IF EXISTS trg_mcp_upd ON mcp_servers;
 CREATE TRIGGER trg_mcp_upd BEFORE UPDATE ON mcp_servers
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -872,6 +984,8 @@ CREATE TABLE IF NOT EXISTS conversation_activities (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_conv_act ON conversation_activities(conversation_id, id);
+CREATE INDEX IF NOT EXISTS idx_conv_act_tool_call ON conversation_activities(conversation_id, tool_use_id, id)
+  WHERE kind IN ('tool_use', 'tool_result');
 
 -- =====================================================================
 -- J. Agent 触发器
@@ -955,6 +1069,11 @@ CREATE INDEX IF NOT EXISTS idx_intercept_pending_status ON intercept_pending(sta
 CREATE INDEX IF NOT EXISTS idx_intercept_pending_task   ON intercept_pending(task_id, created_at DESC);
 -- 补旧库:reason 列(已发版,加列要带 IF NOT EXISTS)。
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
+-- Detail payloads are lazy-loaded; NULL preserves the meaning of legacy history.
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS audit JSONB;
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decision_source TEXT NOT NULL DEFAULT '';
+UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 'rule'
+ WHEN reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
 
 -- =====================================================================
 -- L. 漏洞发现持久化
@@ -972,7 +1091,7 @@ CREATE TABLE IF NOT EXISTS findings (
     evidence    TEXT NOT NULL DEFAULT '',
     worker      TEXT NOT NULL DEFAULT '',
     asset_ids   JSONB NOT NULL DEFAULT '[]',
-    -- 处置状态：pending 待处理 / in_progress 处理中 / confirmed 已确认 / resolved 已处理 /
+    -- 处置状态：pending 待处理 / in_progress 处理中 / confirmed 已确认 / resolved 已处理 / fixed 已修复 /
     -- false_positive 误报 / ignored 忽略 / duplicate 重复 / risk_accepted 风险接受。
     -- 取值不加 CHECK：旧库靠下面的 ALTER 补列,CHECK 无法回填,统一由 server 侧白名单校验。
     status      TEXT NOT NULL DEFAULT 'pending',
@@ -989,6 +1108,71 @@ CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status, created_at DE
 -- 「按资产」视图靠 asset_ids @> '[<id>]' 反查发现,没有这个 GIN 索引就是全表扫。
 CREATE INDEX IF NOT EXISTS idx_findings_asset_ids ON findings USING GIN(asset_ids jsonb_path_ops);
 
+-- 手动复测属于独立会话；结论与原漏洞处置状态分开保存。
+CREATE TABLE IF NOT EXISTS finding_retests (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    conversation_id BIGINT UNIQUE REFERENCES conversations(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','stopped')),
+    verdict TEXT NOT NULL DEFAULT '' CHECK (verdict IN ('','reproduced','fixed','inconclusive')),
+    notes TEXT NOT NULL DEFAULT '',
+    snapshot JSONB NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_finding_retests_history ON finding_retests(finding_id, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_retests_active ON finding_retests(finding_id)
+    WHERE status IN ('pending','running');
+
+-- 删除会话保留复测记录，同时解除尚未结束的复测占用。
+CREATE OR REPLACE FUNCTION stop_deleted_conversation_retest() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE finding_retests SET status='stopped', error='复测会话已删除', finished_at=now()
+    WHERE conversation_id=OLD.id AND status IN ('pending','running');
+    RETURN OLD;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_conversation_retest_delete ON conversations;
+CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
+    FOR EACH ROW EXECUTE FUNCTION stop_deleted_conversation_retest();
+
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
+    id TEXT PRIMARY KEY,
+    source_traffic_id TEXT NOT NULL,
+    captured_at BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    method TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    content_type TEXT NOT NULL DEFAULT '',
+    req_head TEXT NOT NULL,
+    resp_head TEXT NOT NULL,
+    req_hash TEXT NOT NULL,
+    resp_hash TEXT NOT NULL,
+    req_len BIGINT NOT NULL,
+    resp_len BIGINT NOT NULL,
+    unreferenced_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS finding_traffic_bindings (
+    id BIGSERIAL PRIMARY KEY,
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    snapshot_id TEXT NOT NULL REFERENCES traffic_evidence_snapshots(id),
+    role TEXT NOT NULL DEFAULT 'supporting',
+    note TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(finding_id, snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS idx_finding_traffic_order ON finding_traffic_bindings(finding_id, position, id);
+CREATE INDEX IF NOT EXISTS idx_finding_traffic_snapshot ON finding_traffic_bindings(snapshot_id);
+
 -- =====================================================================
 -- M. 后端日志持久化
 -- =====================================================================
@@ -1000,3 +1184,247 @@ CREATE TABLE IF NOT EXISTS server_logs (
     text       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_server_logs_id ON server_logs(id DESC);
+
+-- Independent /btw history and the latest provider-ready main checkpoint.
+CREATE TABLE IF NOT EXISTS side_question_sessions (
+    session_key TEXT PRIMARY KEY,
+    conversation_id BIGINT REFERENCES conversations(id) ON DELETE CASCADE,
+    task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
+    exploration_id BIGINT REFERENCES explorations(id) ON DELETE CASCADE,
+    intent_id BIGINT REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+    run_id BIGINT NOT NULL,
+    version BIGINT NOT NULL,
+    snapshot JSONB NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 0,
+    CHECK ((conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
+        OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_side_sessions_conv ON side_question_sessions(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_side_sessions_task ON side_question_sessions(task_id);
+CREATE INDEX IF NOT EXISTS idx_side_sessions_exp ON side_question_sessions(exploration_id);
+CREATE INDEX IF NOT EXISTS idx_side_sessions_intent ON side_question_sessions(intent_id);
+
+CREATE TABLE IF NOT EXISTS side_question_requests (
+    id TEXT PRIMARY KEY,
+    ordinal BIGSERIAL UNIQUE,
+    session_key TEXT NOT NULL REFERENCES side_question_sessions(session_key) ON DELETE CASCADE,
+    generation BIGINT NOT NULL,
+    client_id TEXT NOT NULL,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('running','completed','failed','cancelled','interrupted')),
+    error TEXT NOT NULL DEFAULT '',
+    model JSONB NOT NULL,
+    snapshot_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sequence BIGINT NOT NULL DEFAULT 0,
+    usage JSONB NOT NULL DEFAULT '{}',
+    UNIQUE(session_key,generation,client_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_side_request_running ON side_question_requests(session_key) WHERE status='running';
+CREATE INDEX IF NOT EXISTS idx_side_requests_history ON side_question_requests(session_key,ordinal DESC);
+
+-- Additive v3 archive fields; old archives restore these as empty objects.
+ALTER TABLE side_question_sessions ADD COLUMN IF NOT EXISTS memory JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE side_question_requests ADD COLUMN IF NOT EXISTS context_info JSONB NOT NULL DEFAULT '{}';
+
+-- =====================================================================
+-- 资产拦截规则（全局黑名单）
+-- 独立于 §K 命令拦截(intercept_rules)：intercept_rules 匹配工具名/入参文本，
+-- 这张表匹配「目标资产」——全等/模糊的域名·IP·URL 以及 CIDR 网段。
+-- 仅存规则；具体的匹配/拦截逻辑在别处实现。
+-- kind 七种：
+--   exact_domain / exact_ip / exact_url  —— 全等匹配
+--   fuzzy_domain / fuzzy_ip / fuzzy_url  —— 模糊匹配
+--   cidr                                 —— CIDR 网段
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS asset_intercept_rules (
+    id          BIGSERIAL PRIMARY KEY,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    kind        TEXT NOT NULL CHECK (kind IN (
+                    'exact_domain', 'exact_ip', 'exact_url',
+                    'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
+                    'cidr')),
+    pattern     TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    builtin     BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_asset_intercept_enabled ON asset_intercept_rules(enabled);
+DROP TRIGGER IF EXISTS trg_asset_intercept_rules_upd ON asset_intercept_rules;
+CREATE TRIGGER trg_asset_intercept_rules_upd BEFORE UPDATE ON asset_intercept_rules
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =====================================================================
+-- 任务级资产拦截/允许规则
+-- 与全局 asset_intercept_rules 同构（kind/pattern/note/enabled），但按 task_id
+-- 关联、随任务级联删除；创建任务时录入、任务详情里可编辑。
+-- action: 'block'=拦截(禁止测试)  'allow'=允许(白名单)。
+-- 执行判定：先按 拦截规则(全局 ∪ 任务block) 匹配，命中即禁止；未命中且该任务存在
+-- 启用的 allow 规则时，须命中某条 allow 才放行，否则「不允许测试」。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS task_intercept_rules (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    action      TEXT NOT NULL DEFAULT 'block' CHECK (action IN ('block','allow')),
+    kind        TEXT NOT NULL CHECK (kind IN (
+                    'exact_domain', 'exact_ip', 'exact_url',
+                    'fuzzy_domain', 'fuzzy_ip', 'fuzzy_url',
+                    'cidr')),
+    pattern     TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_task_intercept_task ON task_intercept_rules(task_id);
+-- 补旧库(本会话早前建过该表、无 action 列)：加列(带 IF NOT EXISTS)。
+ALTER TABLE task_intercept_rules ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'block';
+DROP TRIGGER IF EXISTS trg_task_intercept_rules_upd ON task_intercept_rules;
+CREATE TRIGGER trg_task_intercept_rules_upd BEFORE UPDATE ON task_intercept_rules
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =====================================================================
+-- M. 漏洞 IM 推送
+--
+-- 三张表刻意分开，核心是**爆炸半径**：写漏洞的那个事务(RecordFindingTx，
+-- 持任务行锁)只允许做一次盲 INSERT，不读渠道表、不跑用户的过滤规则。否则
+-- 一条配错的 webhook 过滤条件就能污染/中止事务，导致漏洞存不进去。
+--
+--   notification_channels   渠道实例配置(可变、含凭据、UI 管理)
+--   notification_events     事件事实(写漏洞事务内盲插，含渲染快照)
+--   notification_deliveries 投递任务(事务外 fan-out 产生，承载状态/重试/批次)
+-- =====================================================================
+
+-- 渠道实例：同一 kind 可配任意多个(如「应急群」「日常群」各一个钉钉机器人)。
+-- kind 取值由 server 侧白名单校验，不加 CHECK：与 findings.status 同理，
+-- 后续加渠道不应要求改表结构。
+CREATE TABLE IF NOT EXISTS notification_channels (
+    id           BIGSERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    -- dingtalk 钉钉 / feishu 飞书 / wecom 企业微信 / webhook 通用 / telegram / email
+    kind         TEXT NOT NULL,
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    -- 凭据(明文存储，UI 掩码回显；见 server 侧 maskChannelSecrets)。六种渠道字段差异极大，
+    -- 统一 JSONB + Go 侧按 kind 严格校验，避免为每渠道加一堆 NULL 列：
+    --   dingtalk {webhook,secret}
+    --   feishu   {webhook,secret}
+    --   wecom    {webhook}
+    --   webhook  {url,method,content_type,headers{},body_template}
+    --   telegram {bot_token,chat_id,base_url}
+    --   email    {host,port,username,password,from,to[],tls}
+    config       JSONB NOT NULL DEFAULT '{}',
+    -- 推送时机：realtime 命中即推 / digest 进批次按全局周期汇总成一条。
+    mode         TEXT NOT NULL DEFAULT 'realtime',
+    -- 过滤条件，字段全部可选(缺省=不过滤)：
+    --   min_severity       ''|low|medium|high|critical
+    --   task_ids/asset_ids 空数组=不限；非空则须交集非空
+    --   vulnclass_include/exclude 关键词数组(大小写不敏感子串)；include 空=全收
+    --   on_status_change   bool，仅 realtime 模式有意义
+    filter       JSONB NOT NULL DEFAULT '{}',
+    -- 每分钟投递上限；0=不限流。默认 20 对齐钉钉/企微官方硬限。
+    -- 超限不丢消息，只把投递推迟到下一个 tick。
+    rate_per_min INTEGER NOT NULL DEFAULT 20,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+DROP TRIGGER IF EXISTS trg_notification_channels_upd ON notification_channels;
+CREATE TRIGGER trg_notification_channels_upd BEFORE UPDATE ON notification_channels
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 事件事实。由 RecordFindingTx / 状态变更事务**同事务**写入，保证「漏洞落库」
+-- 与「推送任务存在」原子一致——不存在提交成功但没入队、消息永久丢失的窗口。
+-- snapshot 刻意冗余：漏洞事后会被改名/改级别/改状态，推送内容应反映「事发当时」，
+-- 且 fan-out 与渲染不必回查 findings/tasks/assets 多张表。
+-- finding 删除后事件不级联删除：与 findings 表「任务删除仍独立留存」的语义一致。
+CREATE TABLE IF NOT EXISTS notification_events (
+    id         BIGSERIAL PRIMARY KEY,
+    -- finding_created | finding_status_changed
+    kind       TEXT NOT NULL,
+    finding_id BIGINT NOT NULL,
+    snapshot   JSONB NOT NULL,
+    -- fan-out 幂等标记：dispatcher 按此列取待分派事件，处理完置 true。
+    -- 用列而非删行，以便投递历史能回溯到事件。
+    fanned_out BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_notification_events_pending
+    ON notification_events(id) WHERE NOT fanned_out;
+
+-- 投递任务：一条事件 × 一个启用渠道 = 一行。fan-out 在事务外做，所以渠道
+-- 后开不会补历史(与 agent_triggers 的「迟开 trigger 不补历史」语义一致，
+-- 避免启用渠道时一次性刷屏历史积压)。
+-- channel_id 级联删除：渠道配置都没了，其投递历史无意义。
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id          BIGSERIAL PRIMARY KEY,
+    event_id    BIGINT NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+    channel_id  BIGINT NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+    -- pending 待发 / sent 已发 / failed 重试耗尽(可手动重发) / skipped 渠道停用或批次取消
+    -- pending 待发 / sending 已被某 dispatcher 领取(租约未到期) / sent 已发 /
+    -- failed 重试耗尽或永久失败(可手动重发) / skipped 渠道停用。取值不加 CHECK，
+    -- 与 findings.status 同理，由 server 侧白名单校验。
+    state       TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    -- 兼作「下次可领取时间」与「租约到期时间」：领取时把它推到未来即构成租约，
+    -- 于是「租约未到期」与「未到重试时间」共用同一个条件表达，不需要额外的
+    -- lease_until 列。进程崩溃留下的 sending 行会因租约到期被下一轮重新领取。
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_error  TEXT NOT NULL DEFAULT '',
+    -- digest 模式同批次共享；realtime 恒为 NULL。整批渲染成一条消息后一起置 sent。
+    batch_id    BIGINT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_due
+    ON notification_deliveries(next_attempt_at) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_history
+    ON notification_deliveries(id DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
+    ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
+    ON notification_deliveries(channel_id, id DESC);
+
+-- =====================================================================
+-- WebShell 连接管理：Agent 获取到目标 shell 后自动登记，人工也可手动添加。
+-- password 是连接凭据，列表接口不回传；type/mode/encoding 决定客户端协议。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS webshells (
+    id               BIGSERIAL PRIMARY KEY,
+    name             TEXT NOT NULL DEFAULT '',
+    url              TEXT NOT NULL,
+    -- simple 直接命令/PHP/JSP/ASP/ASPX eval；behinder/godzilla 加密马；custom 自定义模板
+    type             TEXT NOT NULL DEFAULT 'simple',
+    -- simple: raw | php_eval | jsp_eval | asp_eval | aspx_eval；加密马: php
+    lang             TEXT NOT NULL DEFAULT 'php',
+    mode             TEXT NOT NULL DEFAULT 'raw',
+    password         TEXT NOT NULL DEFAULT '',
+    method           TEXT NOT NULL DEFAULT 'POST',
+    param            TEXT NOT NULL DEFAULT 'pass',
+    headers          JSONB NOT NULL DEFAULT '{}',
+    body_template    TEXT NOT NULL DEFAULT '',
+    response_regex   TEXT NOT NULL DEFAULT '',
+    response_b64     BOOLEAN NOT NULL DEFAULT false,
+    -- auto=连接时自动探测传输变体；探测成功后把具体变体写入 transport
+    encoding         TEXT NOT NULL DEFAULT 'auto',
+    transport        TEXT NOT NULL DEFAULT '',
+    insecure         BOOLEAN NOT NULL DEFAULT true,
+    timeout_seconds  INTEGER NOT NULL DEFAULT 15,
+    -- 连接测试探测到的目标系统：linux | windows | unknown
+    os_type          TEXT NOT NULL DEFAULT '',
+    task_id          BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    target           TEXT NOT NULL DEFAULT '',
+    notes            TEXT NOT NULL DEFAULT '',
+    -- unknown | ok | fail
+    status           TEXT NOT NULL DEFAULT 'unknown',
+    last_error       TEXT NOT NULL DEFAULT '',
+    last_checked_at  TIMESTAMPTZ,
+    last_used_at     TIMESTAMPTZ,
+    created_by       TEXT NOT NULL DEFAULT 'user',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_webshells_task ON webshells(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webshells_created ON webshells(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webshells_url ON webshells(url);
+CREATE INDEX IF NOT EXISTS idx_webshells_status ON webshells(status, created_at DESC);

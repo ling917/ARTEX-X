@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,6 +54,8 @@ CREATE TABLE IF NOT EXISTS exchanges (
 CREATE INDEX IF NOT EXISTS idx_ex_host ON exchanges(host);
 CREATE INDEX IF NOT EXISTS idx_ex_tmpl ON exchanges(host, url_template);
 CREATE INDEX IF NOT EXISTS idx_ex_ts   ON exchanges(ts);
+CREATE INDEX IF NOT EXISTS idx_ex_status ON exchanges(status);
+CREATE INDEX IF NOT EXISTS idx_ex_resp   ON exchanges(resp_len);
 
 CREATE TABLE IF NOT EXISTS exchange_bodies (
   id        TEXT PRIMARY KEY,
@@ -99,7 +102,36 @@ const (
 	// maxBlobRead caps one traffic_blob read so paging through a large body never
 	// floods the agent's context.
 	maxBlobRead = 8 * 1024
+	// autoVacuumIncremental is SQLite's numeric value for auto_vacuum=incremental.
+	autoVacuumIncremental = 2
+	// reclaimChunkPages bounds how much index space one locked step returns to the
+	// filesystem (pages are 4KiB, so ~32MB). Reclamation holds the write lock, and
+	// record() runs before go-mitmproxy replies to the client, so an unbounded
+	// pass would stall the very requests being recorded.
+	reclaimChunkPages = 8192
+	// reclaimMergePages bounds the full-text merge done alongside each chunk.
+	// Deleting from a contentless_delete index only writes tombstones; merging is
+	// what discards them, and left undone the index grows on every deletion.
+	reclaimMergePages = 256
+	// reclaimMergeSteps bounds how many merges one reclamation performs. fts5
+	// offers no way to ask whether an index has settled — its special INSERT
+	// registers a row change of its own, so change counting cannot tell a real
+	// merge from a no-op — so the budget is simply spent down, and whatever is
+	// left over falls to the next deletion.
+	reclaimMergeSteps = 16
+	// reclaimMaxSteps backstops the loop. Both merging and incremental_vacuum are
+	// documented to stop making progress eventually, but a reclamation that cannot
+	// converge must give up rather than spin holding the write lock.
+	reclaimMaxSteps = 512
+	// reclaimBudget caps one background reclamation. Deleting a busy host can free
+	// gigabytes, and the next deletion resumes wherever this one stopped.
+	reclaimBudget = 5 * time.Minute
 )
+
+// TrafficSearchDescription is persisted into the tool catalog for new and
+// upgraded installations. Keep it in the traffic package so the runtime tool
+// and the catalog migration cannot drift apart.
+const TrafficSearchDescription = "查询记录代理已抓取的目标流量（必须指定 host；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）。仅返回极轻量索引(id/method/url/status/resp_len)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。"
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
@@ -113,9 +145,22 @@ type Traffic struct {
 	// build without FTS5: recording and metadata search still work, body search
 	// degrades to unsupported rather than erroring.
 	fts bool
-	// reaping tracks background reclamation of legacy trees, so shutdown and tests
-	// can wait for it instead of racing it.
+	// reaping tracks background reclamation of legacy trees and index space, so
+	// shutdown and tests can wait for it instead of racing it.
 	reaping sync.WaitGroup
+	// incrementalVacuum reports whether the index can return freed pages to the
+	// filesystem on its own. False on a database created before this was the
+	// default: PRAGMA incremental_vacuum is a silent no-op there, so deletions
+	// reclaim nothing until an explicit full compaction converts the file.
+	incrementalVacuum bool
+	// reclaiming keeps a single background reclamation in flight. Concurrent ones
+	// would only contend for wmu, never finish sooner.
+	reclaiming atomic.Bool
+	// closed is shut by Close so a reclamation abandons its remaining budget
+	// instead of holding shutdown open for minutes. Nil on the zero value, which
+	// stopping() treats as "not closing".
+	closed    chan struct{}
+	closeOnce sync.Once
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
@@ -134,25 +179,26 @@ func Open(dir, addr string) (*Traffic, error) {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", filepath.Join(dir, "_index", "index.sqlite"))
+	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
+	// than in a one-off Exec: the pool opens connections on demand, and an Exec
+	// only configures whichever one happened to serve it — leaving every other
+	// connection to fail instantly the moment a writer holds the database.
+	// The driver splits the DSN at the first '?', so a data directory containing
+	// one would silently name a different file; that path falls back to a bare
+	// DSN, where initIndex still applies the pragmas to its own connection.
+	index := filepath.Join(dir, "_index", "index.sqlite")
+	dsn := index
+	if !strings.ContainsRune(index, '?') {
+		dsn = "file:" + index + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=5000"} {
-		if _, err := db.Exec(p); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if _, err := db.Exec(indexSchema); err != nil {
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
-	}
-	t := &Traffic{dir: dir, addr: addr, db: db}
-	if _, err := db.Exec(ftsSchema); err != nil {
-		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
-	} else {
-		t.fts = true
 	}
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
@@ -185,6 +231,66 @@ func Open(dir, addr string) (*Traffic, error) {
 	return t, nil
 }
 
+// initIndex applies the schema on a single pinned connection. Pinning is what
+// makes auto_vacuum reliable: it can only be set while the database still holds
+// no tables, and only the VACUUM that follows writes it into the file header —
+// two steps a pooled *sql.DB is free to route to different connections, which
+// would silently drop the setting.
+//
+// auto_vacuum=incremental is what lets a deletion hand freed pages back to the
+// filesystem. Without it SQLite merely chains them onto its freelist, so the
+// index file never shrinks no matter how much traffic is deleted — and since
+// every body below maxInlineBody lives in that file, plus a trigram index
+// roughly twice the size of the text it covers, a capture-heavy install ends up
+// holding gigabytes for traffic it no longer has. On a database that already has
+// tables the pragma is a documented no-op, so installs created before this keep
+// auto_vacuum=0 until a full compaction converts the file; incrementalVacuum
+// records that so reclaim can say so instead of pretending to reclaim.
+func (t *Traffic) initIndex() error {
+	ctx := context.Background()
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Re-applied rather than left to the DSN so the bare-DSN fallback in Open is
+	// still correct: journal_mode persists in the file header, which is what every
+	// later connection reads.
+	for _, p := range []string{`PRAGMA journal_mode=WAL`, `PRAGMA busy_timeout=5000`} {
+		if _, err := conn.ExecContext(ctx, p); err != nil {
+			return err
+		}
+	}
+	var tables int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='table'`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 0 {
+		for _, p := range []string{`PRAGMA auto_vacuum=incremental`, `VACUUM`} {
+			if _, err := conn.ExecContext(ctx, p); err != nil {
+				return err
+			}
+		}
+	}
+	var mode int
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	t.incrementalVacuum = mode == autoVacuumIncremental
+	if !t.incrementalVacuum {
+		log.Printf("[traffic] 索引库未启用增量回收（auto_vacuum=%d）：删除流量不会缩小 index.sqlite，需要执行一次存储压缩来转换", mode)
+	}
+	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
+		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
+		return nil
+	}
+	t.fts = true
+	return nil
+}
+
 // hostOnly strips an optional :port, so passthrough keys match whether the host
 // arrives as "example.com:443" (CONNECT) or "example.com" (request URL).
 func hostOnly(hostport string) string {
@@ -194,8 +300,14 @@ func hostOnly(hostport string) string {
 	return hostport
 }
 
-// ProxyAddr returns the address workers should set as HTTP(S)_PROXY.
-func (t *Traffic) ProxyAddr() string { return "http://127.0.0.1" + t.addr }
+// ProxyAddr returns the address workers should set as HTTP(S)_PROXY. A bare
+// ":port" means "bind all interfaces" (legacy default), so map it to loopback.
+func (t *Traffic) ProxyAddr() string {
+	if strings.HasPrefix(t.addr, ":") {
+		return "http://127.0.0.1" + t.addr
+	}
+	return "http://" + t.addr
+}
 
 // SetUpstreamProxy points every captured request at a global egress proxy
 // (http/https/socks5, optional user:pass in the URL). An empty raw string clears
@@ -248,10 +360,26 @@ func (t *Traffic) Start() error { return t.proxy.Start() }
 
 // Close waits for background tree reclamation to finish before closing the
 // index, so shutdown never leaves a goroutine unlinking files out from under a
-// removed data directory.
+// removed data directory. Index-space reclamation is signalled to stop first:
+// it holds a whole minutes-long budget, and finishing it is never worth delaying
+// shutdown for — the next deletion resumes it.
 func (t *Traffic) Close() error {
+	if t.closed != nil {
+		t.closeOnce.Do(func() { close(t.closed) })
+	}
 	t.reaping.Wait()
 	return t.db.Close()
+}
+
+// stopping reports whether Close has been called. A nil channel (the zero value)
+// is never ready, so this reads as "not closing" without a separate guard.
+func (t *Traffic) stopping() bool {
+	select {
+	case <-t.closed:
+		return true
+	default:
+		return false
+	}
 }
 func (t *Traffic) DB() *sql.DB { return t.db }
 
@@ -682,13 +810,53 @@ func ftsQuote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// Page returns one page of exchange metadata filtered by an optional host
-// substring, exact method, and a free-text query q that matches across the
-// indexed metadata columns (host/url/method/content-type/status) and, when the
-// term is long enough for the trigram index, across captured request/response
-// text as well. Also returns the total number of rows matching that filter (for
-// the UI's pagination). Newest first. Bodies are never included in the rows.
-func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeMeta, total int, err error) {
+// PageQuery bundles the optional filters and sort order for Page. Every filter
+// is combined with AND; an empty string skips that filter, and RespMin/RespMax
+// of -1 skip the response-size bounds. An empty Sort/Order defaults to
+// newest-first by timestamp.
+type PageQuery struct {
+	Host    string // host substring
+	Method  string // exact method (case-insensitive)
+	Query   string // broad search box: metadata columns OR captured text
+	Body    string // content box: captured request/response text only (full-text)
+	Path    string // url_template substring — the vulnerability's path
+	Status  string // exact code ("404") or class bucket ("4xx")
+	RespMin int64  // minimum resp_len, or -1 when unset
+	RespMax int64  // maximum resp_len, or -1 when unset
+	Sort    string // ts | status | resp_len (default ts)
+	Order   string // asc | desc (default desc)
+}
+
+// sortColumns whitelists the columns Page may order by, so the caller-supplied
+// Sort can never reach the SQL as anything but one of these fixed names.
+var sortColumns = map[string]string{"ts": "ts", "status": "status", "resp_len": "resp_len"}
+
+// statusFilter turns a status token into a SQL condition: an exact code ("404")
+// matches that status, an "Nxx" class ("4xx") matches the whole hundreds band.
+// ok is false for an empty or unrecognized token.
+func statusFilter(s string) (cond string, args []any, ok bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "", nil, false
+	}
+	if len(s) == 3 && s[0] >= '1' && s[0] <= '5' && s[1] == 'x' && s[2] == 'x' {
+		base := int(s[0]-'0') * 100
+		return "status>=? AND status<?", []any{base, base + 100}, true
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return "status=?", []any{n}, true
+	}
+	return "", nil, false
+}
+
+// Page returns one page of exchange metadata for the traffic list, filtered by
+// the criteria in f (all optional, combined with AND) and ordered by the
+// requested column. Query is the broad search box (metadata columns OR, when the
+// term is long enough for the trigram index, captured request/response text);
+// Body narrows to exchanges whose captured text matches, via that same index.
+// Also returns the total number of rows matching the filter (for the UI's
+// pagination). Bodies are never included in the rows.
+func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -706,13 +874,25 @@ func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeM
 		where += cond
 		args = append(args, vs...)
 	}
-	if h := strings.TrimSpace(host); h != "" {
+	if h := strings.TrimSpace(f.Host); h != "" {
 		add("host LIKE ?", "%"+h+"%")
 	}
-	if m := strings.TrimSpace(method); m != "" {
+	if m := strings.TrimSpace(f.Method); m != "" {
 		add("method=?", strings.ToUpper(m))
 	}
-	if s := strings.TrimSpace(q); s != "" {
+	if p := strings.TrimSpace(f.Path); p != "" {
+		add("url_template LIKE ?", "%"+p+"%")
+	}
+	if cond, sargs, ok := statusFilter(f.Status); ok {
+		add(cond, sargs...)
+	}
+	if f.RespMin >= 0 {
+		add("resp_len>=?", f.RespMin)
+	}
+	if f.RespMax >= 0 {
+		add("resp_len<=?", f.RespMax)
+	}
+	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
 		const meta = "host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
 		// Metadata match OR full-text match: one search box, widest recall. Terms
@@ -723,11 +903,30 @@ func (t *Traffic) Page(host, method, q string, page, size int) (rows []ExchangeM
 			add("("+meta+")", like, like, like, like, like, like)
 		}
 	}
+	// Body is the dedicated content box: it only searches captured request/response
+	// text, so it goes straight to the full-text index with no metadata fallback. A
+	// term too short for the trigram tokenizer cannot be served and is skipped
+	// rather than guessed at — the UI hints at the three-character minimum.
+	if b := strings.TrimSpace(f.Body); b != "" {
+		if cond, arg, ok := t.ftsFilter(b); ok {
+			add(cond, arg)
+		}
+	}
 	if err = t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	col := sortColumns[strings.ToLower(strings.TrimSpace(f.Sort))]
+	if col == "" {
+		col = "ts"
+	}
+	dir := "DESC"
+	if strings.EqualFold(strings.TrimSpace(f.Order), "asc") {
+		dir = "ASC"
+	}
+	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
+	// total and pagination stable even when the sort column has many ties.
 	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
-		where + ` ORDER BY ts DESC LIMIT ? OFFSET ?`
+		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
 	if err != nil {
@@ -859,11 +1058,122 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 	}
 	t.reapStage(stageDir)
 	if n > 0 {
+		t.reclaim()
 		if err := t.gcBlobs(); err != nil {
 			return n, err
 		}
 	}
 	return n, nil
+}
+
+// DeleteAll removes every recorded exchange — the page's clear-everything
+// action. It differs from the host-scoped deletions in two ways. It sweeps host
+// directories without consulting the index, because "clear everything" should
+// leave nothing behind and a directory whose rows are already gone would
+// otherwise survive. And it ends with a full compaction: VACUUM costs what it
+// keeps, so an emptied index is the one moment it is free, and it is also the
+// only way to switch on auto_vacuum for a database created without it.
+//
+// Evidence already bound to a finding is untouched. Those bodies were copied
+// into the evidence store when they were bound, precisely so that disposable
+// traffic could be cleared without taking proof with it.
+//
+// Returns the number of exchanges deleted and how many bytes of index the
+// compaction handed back.
+func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	before := t.indexBytes()
+	trees, err := t.allHostTrees()
+	if err != nil {
+		return 0, 0, err
+	}
+	tx, err := t.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+	if deleted, err = t.deleteWhere(tx, `1=1`); err != nil {
+		return 0, 0, err
+	}
+	// Staged before the commit so a filesystem failure can still abort the whole
+	// deletion, exactly as in DeleteHost.
+	stageDir, moves, err := t.stageTrees(trees)
+	if err != nil {
+		return 0, 0, errors.Join(err, restoreTrees(stageDir, moves))
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, errors.Join(fmt.Errorf("提交流量索引删除: %w", err), restoreTrees(stageDir, moves))
+	}
+	t.reapStage(stageDir)
+	if err := t.gcBlobs(); err != nil {
+		return deleted, 0, err
+	}
+	if err := t.compactIndex(); err != nil {
+		// The deletion is already durable; compaction is disk space, not
+		// correctness, so it must not turn a completed purge into a failed one.
+		log.Printf("[traffic] 压实索引失败：%v", err)
+		return deleted, 0, nil
+	}
+	return deleted, before - t.indexBytes(), nil
+}
+
+// allHostTrees lists every host directory left by the pre-SQLite layout. Unlike
+// hostTrees it does not go through the index, so it also finds directories whose
+// rows are already gone. Underscore-prefixed entries are the store's own
+// (_index, _blobs, _ca, _delete_staging) and are never hosts.
+func (t *Traffic) allHostTrees() ([]string, error) {
+	entries, err := os.ReadDir(t.dir)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), "_") {
+			dirs = append(dirs, filepath.Join(t.dir, e.Name()))
+		}
+	}
+	return dirs, nil
+}
+
+// compactIndex rewrites the index into a fresh file, which is what actually
+// returns its pages to the filesystem. VACUUM's runtime and temporary space
+// scale with the content it keeps, so this is only reached right after DeleteAll
+// has emptied the index — never as a routine step. It doubles as the conversion
+// path for a database created before auto_vacuum=incremental: that pragma only
+// takes effect through the VACUUM that follows it, and both must run on the same
+// connection. Callers must hold wmu.
+func (t *Traffic) compactIndex() error {
+	ctx := context.Background()
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if t.fts {
+		// A full merge, not the bounded one reclaim uses: with the index emptied
+		// there is nothing left to merge, so this only discards the tombstones.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts) VALUES('optimize')`); err != nil {
+			return fmt.Errorf("合并全文索引: %w", err)
+		}
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA auto_vacuum=incremental`); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("压实索引: %w", err)
+	}
+	var mode int
+	if err := conn.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	// A legacy database has just been converted, so later deletions can reclaim
+	// space on their own instead of waiting for another purge.
+	t.incrementalVacuum = mode == autoVacuumIncremental
+	if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("截断 WAL: %w", err)
+	}
+	return nil
 }
 
 // deleteWhere removes every trace of the exchanges matching the condition:
@@ -1260,6 +1570,7 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 		needsGC = true
 	}
 	if needsGC {
+		t.reclaim()
 		if err := t.gcBlobs(); err != nil {
 			errs = append(errs, err)
 		}
@@ -1351,6 +1662,7 @@ func (s *HostDeleteStage) Commit() error {
 	// it now runs in the background, while collection below only needs them to be
 	// out of the live tree — which the staging rename already guaranteed.
 	s.traffic.reapStage(s.stageDir)
+	s.traffic.reclaim()
 	var errs []error
 	if err := s.traffic.gcBlobs(); err != nil {
 		errs = append(errs, fmt.Errorf("回收流量 blob: %w", err))
@@ -1358,6 +1670,127 @@ func (s *HostDeleteStage) Commit() error {
 	s.done = true
 	s.traffic.wmu.Unlock()
 	return errors.Join(errs...)
+}
+
+// indexBytes is the index's real footprint on disk: the database plus its
+// write-ahead log and shared-memory file, since those are what an operator sees
+// the data directory holding.
+func (t *Traffic) indexBytes() int64 {
+	base := filepath.Join(t.dir, "_index", "index.sqlite")
+	var total int64
+	for _, p := range []string{base, base + "-wal", base + "-shm"} {
+		if st, err := os.Stat(p); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
+// reclaim hands space freed by a deletion back to the filesystem. Deleting rows
+// only makes them invisible: SQLite chains their pages onto a freelist, and
+// deleting from the contentless_delete full-text index writes tombstones rather
+// than removing the postings they hide. Neither shrinks a single byte on disk,
+// and since bodies below maxInlineBody live in that same file, an install that
+// captures heavily ends up holding far more than the traffic it still has.
+//
+// The work is done in the background, in bounded steps that drop the write lock
+// between them, because it is proportional to what was deleted — freeing several
+// gigabytes under one lock would stall record(), which go-mitmproxy calls before
+// it replies to the client, and so would stall the requests being recorded.
+// Safe to call with wmu held: the background pass simply waits for it.
+//
+// Best-effort throughout. Failing to reclaim costs disk space, never
+// correctness, so errors are logged and the next deletion resumes the work.
+func (t *Traffic) reclaim() {
+	if !t.reclaiming.CompareAndSwap(false, true) {
+		return // one pass at a time; a second would only contend for the lock
+	}
+	t.reaping.Go(func() {
+		defer t.reclaiming.Store(false)
+		// One pinned connection for the whole pass: a long reclamation issues
+		// hundreds of statements, and letting the pool hand each one a different
+		// connection would both churn connections and split the freelist readings
+		// that decide when to stop away from the vacuum they measure.
+		ctx := context.Background()
+		conn, err := t.db.Conn(ctx)
+		if err != nil {
+			log.Printf("[traffic] 回收索引空间失败（获取连接）：%v", err)
+			return
+		}
+		defer conn.Close()
+		deadline := time.Now().Add(reclaimBudget)
+		merges := reclaimMergeSteps
+		for step := 0; ; step++ {
+			t.wmu.Lock()
+			progressed, err := t.reclaimChunk(ctx, conn, &merges)
+			t.wmu.Unlock()
+			if err != nil {
+				log.Printf("[traffic] 回收索引空间失败：%v", err)
+				return
+			}
+			if !progressed {
+				break
+			}
+			if t.stopping() {
+				return // shutdown must not wait out the remaining budget
+			}
+			if step+1 >= reclaimMaxSteps {
+				log.Printf("[traffic] 索引空间回收未做完（已用满 %d 步上限），下次删除时继续", reclaimMaxSteps)
+				return
+			}
+			if time.Now().After(deadline) {
+				log.Printf("[traffic] 索引空间回收未做完（已用满 %s 预算），下次删除时继续", reclaimBudget)
+				return
+			}
+		}
+		// Truncating the log is what makes the reclamation visible on disk: in WAL
+		// mode the freed pages are recorded there first, and a PASSIVE checkpoint
+		// would leave the log itself sitting at its high-water mark.
+		t.wmu.Lock()
+		defer t.wmu.Unlock()
+		if _, err := conn.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			log.Printf("[traffic] 截断 WAL 失败：%v", err)
+		}
+	})
+}
+
+// reclaimChunk does one bounded step and reports whether it made progress, which
+// is what the caller loops on. merges carries the remaining full-text merge
+// budget and is spent down here. Callers must hold wmu.
+func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int) (bool, error) {
+	progressed := false
+	if t.fts && *merges > 0 {
+		// A negative rank is fts5's page budget for one incremental merge.
+		if _, err := conn.ExecContext(ctx, `INSERT INTO ex_fts(ex_fts, rank) VALUES('merge', ?)`, -reclaimMergePages); err != nil {
+			return false, fmt.Errorf("合并全文索引: %w", err)
+		}
+		*merges--
+		progressed = true
+	}
+	if !t.incrementalVacuum {
+		// incremental_vacuum is a silent no-op on a database created with
+		// auto_vacuum=0; only a full compaction can convert one. Merging the
+		// full-text index above still pays off, so stop here rather than earlier.
+		return progressed, nil
+	}
+	var before, after int
+	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&before); err != nil {
+		return false, err
+	}
+	if before == 0 {
+		return progressed, nil
+	}
+	// The budget is a constant and PRAGMA arguments cannot be bound as parameters.
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, reclaimChunkPages)); err != nil {
+		return false, fmt.Errorf("回收索引空闲页: %w", err)
+	}
+	if err := conn.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&after); err != nil {
+		return false, err
+	}
+	// Progress, not an empty freelist, is the right stopping condition:
+	// incremental_vacuum can only release pages it manages to move to the end of
+	// the file, so a residual freelist it cannot shrink is a normal outcome.
+	return progressed || after < before, nil
 }
 
 // gcBlobs removes blobs that no remaining exchange references. Live references
@@ -1474,8 +1907,24 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges WHERE 1=1`
 	args := []any{}
 	if host != "" {
+		hostName, port, err := normalizeSearchHost(host)
+		if err != nil {
+			return nil, err
+		}
 		q += ` AND host=?`
-		args = append(args, host)
+		args = append(args, hostName)
+		if port != "" {
+			// Recorded rows historically store URL.Hostname() (without the port),
+			// so constrain the original URL authority as a compatibility fallback.
+			// New and old captures therefore share the same search contract.
+			authority := net.JoinHostPort(hostName, port)
+			q += ` AND (url LIKE ? OR url LIKE ? OR url LIKE ?)`
+			args = append(args,
+				"%://"+authority+"/%",
+				"%://"+authority+"?%",
+				"%://"+authority,
+			)
+		}
 	}
 	if contains != "" {
 		q += ` AND (url LIKE ? OR url_template LIKE ?)`
@@ -1510,6 +1959,42 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	return out, rows.Err()
 }
 
+// normalizeSearchHost accepts the forms agents commonly have at hand while
+// keeping the stored host (URL.Hostname()) as the canonical host key. A port,
+// when supplied, is applied to the URL authority so captures from different
+// services on the same IP cannot be mixed.
+func normalizeSearchHost(raw string) (host, port string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", errors.New("host 为必填参数")
+	}
+	if strings.Contains(raw, "://") {
+		u, parseErr := url.Parse(raw)
+		if parseErr != nil || u.Host == "" {
+			return "", "", fmt.Errorf("无法解析 host：%q", raw)
+		}
+		host, port = u.Hostname(), u.Port()
+	} else if h, p, splitErr := net.SplitHostPort(raw); splitErr == nil {
+		host, port = h, p
+	} else if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")
+	} else {
+		host = raw
+	}
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return "", "", fmt.Errorf("无法解析 host：%q", raw)
+	}
+	if port != "" {
+		p, parseErr := strconv.Atoi(port)
+		if parseErr != nil || p < 1 || p > 65535 {
+			return "", "", fmt.Errorf("端口无效：%q", port)
+		}
+		port = strconv.Itoa(p)
+	}
+	return strings.ToLower(host), port, nil
+}
+
 // Tools exposes traffic lookup to work agents so they query already-captured
 // traffic instead of re-curling the same resource (token + dedup win).
 func (t *Traffic) Tools() []actool.CoreTool {
@@ -1520,11 +2005,11 @@ func (t *Traffic) Tools() []actool.CoreTool {
 
 	search := actool.Build(actool.Spec{
 		Name:        "traffic_search",
-		Description: "查询记录代理已抓取的目标流量（必须指定 host，可再按 URL 子串或正文关键词过滤）。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符），可用来找响应里的密码、密钥、报错、内网地址等。仅返回极轻量索引(id/method/url/status/resp_len)，不含任何响应内容。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页（page=0 起）；要看某条的请求/响应原文用 traffic_get(id)。回看已访问资源、找端点先用它，避免重复 curl 同一 URL。",
+		Description: TrafficSearchDescription,
 		Schema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填，如 '107.172.96.177:8082'）"},
+				"host":          map[string]any{"type": "string", "description": "按主机过滤（必填；如 '107.172.96.177'、'107.172.96.177:8082' 或 'http://107.172.96.177:8082/path'）"},
 				"contains":      map[string]any{"type": "string", "description": "URL 子串过滤（可选，如 'api' / 'login'）"},
 				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（可选，至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / '内网测试'"},
 				"limit":         map[string]any{"type": "integer", "description": "每页条数，默认 3，最大 10"},
@@ -1543,7 +2028,7 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Host) == "" {
-				return actool.Errorf("host 为必填参数：请指定要查询的主机（如 '107.172.96.177:8082'），避免全库扫描。"), nil
+				return actool.Errorf("host 为必填参数：请指定裸主机、主机:端口或完整 URL，避免全库扫描。"), nil
 			}
 			rows, err := t.query(a.Host, a.Contains, a.BodyContains, a.Page, a.Limit)
 			if err != nil {

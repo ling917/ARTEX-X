@@ -23,7 +23,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import type { MCPServer, MCPTool, Agent } from "@/lib/types";
 
-type Transport = "stdio" | "http";
+type Transport = "stdio" | "http" | "sse";
 type FormState = {
   name: string;
   transport: Transport;
@@ -31,6 +31,7 @@ type FormState = {
   args: string;
   url: string;
   env: string;
+  insecure: boolean;
 };
 const emptyForm: FormState = {
   name: "",
@@ -39,6 +40,7 @@ const emptyForm: FormState = {
   args: "",
   url: "",
   env: "",
+  insecure: false,
 };
 
 export default function MCPPage() {
@@ -84,7 +86,10 @@ export default function MCPPage() {
       const trimmed = line.trim();
       if (!trimmed) continue;
       const idx = trimmed.indexOf("=");
-      if (idx > 0) out[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
+      if (idx > 0) {
+        const key = trimmed.slice(0, idx).trim();
+        if (key) out[key] = trimmed.slice(idx + 1).trim();
+      }
     }
     return out;
   }
@@ -111,6 +116,7 @@ export default function MCPPage() {
       args: (s.args ?? []).join(" "),
       url: s.url ?? "",
       env: envToText(s.env),
+      insecure: s.insecure ?? false,
     });
     setTab("config");
     setOpen(true);
@@ -137,26 +143,28 @@ export default function MCPPage() {
       toast.error("请填写命令");
       return;
     }
-    if (form.transport === "http" && !form.url.trim()) {
+    if (form.transport !== "stdio" && !form.url.trim()) {
       toast.error("请填写远程 URL");
       return;
     }
     setSaving(true);
     try {
       const base =
-        form.transport === "http"
+        form.transport !== "stdio"
           ? {
-              transport: "http" as const,
+              transport: form.transport,
               url: form.url.trim(),
               command: "",
               args: [] as string[],
               env: parseEnv(form.env), // 远程模式下 env 即请求头
+              insecure: form.insecure,
             }
           : {
               transport: "stdio" as const,
               command: form.command.trim(),
               args: form.args.trim() ? form.args.trim().split(/\s+/) : [],
               env: parseEnv(form.env),
+              insecure: false,
             };
       await api.saveMcpServer({
         ...(editing ? { id: editing.id } : {}),
@@ -240,6 +248,13 @@ export default function MCPPage() {
             >
               http（远程）
             </Button>
+            <Button
+              type="button"
+              variant={form.transport === "sse" ? "default" : "outline"}
+              onClick={() => setF({ transport: "sse" })}
+            >
+              sse（旧版）
+            </Button>
           </div>
         </div>
         <div className="grid gap-2">
@@ -284,11 +299,18 @@ export default function MCPPage() {
               value={form.url}
               onChange={(e) => setF({ url: e.target.value })}
             />
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                checked={form.insecure}
+                onCheckedChange={(v) => setF({ insecure: v === true })}
+              />
+              跳过 TLS 证书校验（自签证书）
+            </label>
           </div>
         )}
         <div className="grid gap-2">
           <Label htmlFor="m-env">
-            {form.transport === "http"
+            {form.transport !== "stdio"
               ? "请求头（每行 KEY=VALUE，如 Authorization=Bearer xxx）"
               : "环境变量（每行 KEY=VALUE）"}
           </Label>
@@ -296,7 +318,7 @@ export default function MCPPage() {
             id="m-env"
             className="font-mono"
             placeholder={
-              form.transport === "http" ? "Authorization=Bearer xxxx" : "API_KEY=xxxx\nFOO=bar"
+              form.transport !== "stdio" ? "Authorization=Bearer xxxx" : "API_KEY=xxxx\nFOO=bar"
             }
             value={form.env}
             onChange={(e) => setF({ env: e.target.value })}

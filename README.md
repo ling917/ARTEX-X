@@ -46,6 +46,12 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ---
 
+## 审批记录详情
+
+全局「审批记录」、任务内「拦截审批」及对话中的审批卡片均支持展开查看详情。展示结构参考
+[AegisHook 的审批详情组件](https://github.com/RuoJi6/AegisHook/blob/main/web/src/components/CallDetail.vue)，沿用 ARTEX 的组件和主题：
+
+
 ## 资产同步（ScopeSentry）
 
 支持从 [ScopeSentry](https://github.com/Autumn-27/ScopeSentry) 直接同步资产数据，免去重复收集：
@@ -59,56 +65,56 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 ## 安装
 
 > 依赖数据库 **PostgreSQL**；探索需配置 **LLM**（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可在 UI 里配）。
+> 本仓库**不使用 Docker / docker compose**，前后端均在本机从源码构建。
+
+### 前置依赖
+
+- Go >= 1.26
+- Node.js >= 22 与 npm（构建内嵌前端；不装则只能运行后端，前端需另起 `npm run dev`）
+- PostgreSQL（本机或远程均可）
+- 按需安装常用命令行工具（ripgrep、curl、nmap 等）与 Python 3；浏览器 MCP 需要 Node + Playwright
+
+PostgreSQL 初始化示例：
+
+```bash
+sudo -u postgres psql -c "CREATE USER artex WITH PASSWORD 'yourpass';"
+sudo -u postgres psql -c "CREATE DATABASE artex OWNER artex;"
+```
 
 ### 方式一：一键安装脚本（推荐）
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
+git clone https://github.com/ling917/ARTEX-X.git
+cd ARTEX-X
 ./install.sh
 ```
 
-脚本会：检测 / 自动安装 Docker → 让你选 **① 全部 Docker** 或 **② 本地编译运行**：
-
-- **① 全部 Docker**：填一个 Postgres 密码（可回车随机）→ 自动写 `.env` → `docker compose up -d`。
-- **② 本地运行**：选数据库（连已有 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动。
+脚本会：检查 Go → 询问 PostgreSQL 连接信息 → 生成 `config.json` → 构建前端静态产物并拷入 `server/webui/dist` → `go build -tags embedui` 生成 `./artex` → 启动。
 
 装好后打开 **http://localhost:8787**（首次进入 `/setup` 设置管理员密码）。
 
-### 方式二：Docker Compose（手动）
+### 方式二：手动编译单二进制
 
 ```bash
-git clone https://github.com/Autumn-27/ARTEX.git
-cd ARTEX
-cp .env.example .env          # 填 POSTGRES_PASSWORD、可选 ANTHROPIC_API_KEY
-docker compose up -d          # 拉取 autumn27/artex 镜像 + postgres
-# → http://localhost:8787
-```
-
-镜像已含常用工具（ripgrep/curl/vim/npm/nmap…）；`./skills` 与 `./data` 以绑定挂载持久化。
-
-### 方式三：下载预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载对应平台的 zip，解压后得到 `artex` + `skills/` + `config.example.json`：
-
-```bash
-cp config.example.json config.json   # 填好 database 连接
-./artex                              # → http://localhost:8787
-```
-
-### 方式四：从源码编译单二进制
-
-```bash
-# 1) 前端静态导出
+git clone https://github.com/ling917/ARTEX-X.git
+cd ARTEX-X
+# 1) 数据库配置（也可用 ARTEX_PG_DSN 覆盖）
+cp config.example.json config.json      # 填入 database.*
+# 2) 前端静态导出
 cd web && npm ci && npm run build:static && cd ..
-# 2) 拷进内嵌目录
-cp -r web/out server/webui/dist
-# 3) 编译（-tags embedui 才内嵌前端）
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
-./artex
+# 3) 拷进内嵌目录
+rm -rf server/webui/dist && cp -r web/out server/webui/dist
+# 4) 编译（-tags embedui 才内嵌前端）
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+./start.sh
 ```
 
-### 方式五：构建跨平台 Release 压缩包
+远程 MCP 可在系统设置中选择 `http`（Streamable HTTP）或 `sse`（旧版 SSE）。
+旧版 SSE 服务通常使用 `GET /sse` 建立事件流，再通过服务返回的
+`/message?sessionId=...` 接收 JSON-RPC 请求；配置时将 URL 填为 `/sse`，请求头按
+`Authorization=Bearer <token>` 填写。
+
+### 方式三：构建跨平台发布压缩包
 
 `build.sh` 会先构建并嵌入前端，再使用 Go linker 去除调试信息，并将发布文件压缩为 zip。Release 模式默认生成 Linux amd64/arm64、macOS amd64/arm64 和 Windows amd64 的 zip 包：
 
@@ -128,49 +134,32 @@ ARTEX_TARGETS=linux/amd64,windows/amd64 ./build.sh --release
 
 ## 更新升级
 
-> 升级只换程序、不动数据：Postgres 数据卷 `pgdata`、`./data`（jwt.key / SQLite 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
+> 升级只换程序、不动数据：PostgreSQL 数据库、`./data`（jwt.key 等）、`./skills` 都会保留。**数据库迁移无需手动执行**——`artex` 每次启动会幂等重跑 `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），即“重启即迁移”。升级前仍建议先备份 `./data` 与数据库。
 
-### 方式一：一键更新脚本（推荐）
+> 页面上的「版本与更新」从 `ling917/ARTEX-X` 的 GitHub Release 拉取，需要该仓库已发布带 `SHA256SUMS` 的 Release；未发布时可继续用本地源码重新构建。数据库与 `./data`、`./skills` 均不受影响。
 
-```bash
-cd ARTEX
-./update.sh
-```
-
-脚本先可选 `git pull` 拉取最新代码，再让你选 **① Docker 更新** 或 **② 本地编译更新**（与 `install.sh` 对应）：
-
-- **① Docker**：可指定目标镜像 tag（回车沿用 `.env` 的 `ARTEX_TAG`，缺省 `latest`）→ `docker compose pull` → `docker compose up -d`（换新镜像重启即自动迁移）。
-- **② 本地**：重建前端静态产物 → 重新编译 `./artex`（完成后重启进程生效）。
-
-### 方式二：Docker Compose（手动）
+### 本地编译更新
 
 ```bash
-cd ARTEX
-git pull                       # 更新 compose / 脚本（可选）
-# 指定版本：在 .env 设 ARTEX_TAG=v0.2.0；不设则用 latest
-docker compose pull artex
-docker compose up -d artex     # 换新镜像重启 → 自动迁移 schema
-docker image prune -f          # 清理旧镜像（可选）
-```
-
-### 方式三：预编译二进制（Releases）
-
-到 [Releases](https://github.com/Autumn-27/ARTEX/releases) 下载新版本 zip，停掉旧进程后覆盖 `artex` 与 `skills/`（保留你的 `config.json` 与 `data/`），重启即可：
-
-```bash
-cp -r <解压目录>/skills ./ && cp <解压目录>/artex ./
-./artex
-```
-
-### 方式四：从源码编译
-
-```bash
+cd ARTEX-X
 git pull
 cd web && npm ci && npm run build:static && cd ..
-cp -r web/out server/webui/dist
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
-# 重启 ./artex
+rm -rf server/webui/dist && cp -r web/out server/webui/dist
+CGO_ENABLED=0 go build -tags embedui -trimpath -o artex ./cmd/artex
+# 重启 ./start.sh（或原进程）
 ```
+
+更新会重启服务并中断正在运行的任务，请在空闲时进行。
+
+### 回滚
+
+构建会覆盖 `./artex`，升级前先备份当前二进制：
+
+```bash
+cp artex artex.bak
+```
+
+回滚时停止服务，把 `artex.bak` 换回 `artex` 后重新启动即可。
 
 ---
 
@@ -193,13 +182,54 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 **并发**：每个任务的 work agent 数在「系统设置」里配置（默认 3）。
 
-**常用参数**：`./artex -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。
+**常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
+
+### 反向代理部署（HTTPS / 只开放 443）
+
+前端和 API/SSE 都由同一个后端端口（默认 `:8787`）提供，实时活动流默认走**同源**地址，因此**无需配置 `NEXT_PUBLIC_SSE_BASE`**，公网只开放 443、把 8787 留在内网即可。
+
+SSE 是长连接 + 持续推送，反代**必须关闭缓冲**，否则浏览器能连上却收不到事件（表现为活动流一直转圈）。Nginx 示例：
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name your.domain.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE 关键项：关缓冲、长超时、HTTP/1.1
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+> 仅当 SSE 需要走与页面不同的来源（如独立子域）时，才在**构建期**设置 `NEXT_PUBLIC_SSE_BASE`（该变量在 `next build` 时固化进静态包，容器运行时再设无效）。
 
 ---
 
 
 
 ## 开发
+
+### 手动漏洞复测
+
+任务详情的「复测」页签可分页选择本任务的漏洞、查看历次结论和证据，并手动发起复测。启动后保留当前页签，显示转圈图标和「复测中」；确认修复后同步更新漏洞状态。
+
+在漏洞列表每行操作区点击「复测」，或在漏洞详情的「漏洞复测」区域点击「发起复测」，填写可选的修复版本、测试条件或限制，系统会创建独立的复测 Agent 会话，启动后保留当前页面。列表的平铺、按任务分组和资产视图均支持该入口；复测运行时显示转圈图标和「复测中」，需要查看时点击进入对应会话，结束后恢复「复测」。复测无需重新启动原扫描任务，结论分为「仍可复现」「已修复」「无法确认」，每次的结论、证据和会话链接保存在漏洞详情中。
+
+新版后端首次启动会预置可编辑的「漏洞复测」（`retester`）Agent，可在 Agent 管理中配置提示词、LLM、运行预算和工具。默认使用其绑定的 LLM，未绑定则使用全局激活配置。复测会话成功完成且结论为「已修复」时，系统自动将漏洞处置状态改为「已修复」；执行中、失败、停止或其他结论保留原状态。原始证据和报告始终保留。也可在状态下拉菜单中手动选择「已修复」。同一漏洞正在复测时复用已有会话，停止、失败或服务重启后可重新发起。
+
+本版历史记录通过漏洞详情和会话查看，暂未纳入漏洞报告导出或任务归档包，也未自动关联流量包。演示模式只生成明确标注的模拟记录，不请求真实目标。
+
+### 本地运行与测试
 
 ```bash
 ./dev.sh    # 后端(:8787) + 流量代理(:8788) + 前端 next dev(:5173) → http://localhost:5173
@@ -398,6 +428,34 @@ flowchart TB
 https://github.com/oritera/Cairn
 
 
-## 许可
+## 许可与免责声明
 
-仅供授权测试与研究使用。
+### 开源协议
+
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 授权，完整条款见仓库根目录的 [LICENSE](LICENSE) 文件。
+
+这意味着任何人都可以自由使用、修改和分发本项目，但**衍生作品必须同样以 AGPL-3.0 开源**；特别地，**若你修改本项目并通过网络（如部署为在线服务）向用户提供，也必须向这些用户公开对应的完整源码**。
+
+> ⚠️ **重要提示**：开源协议本身不限制软件的使用用途。以下的「使用限制」与「免责声明」是作者对使用者的额外约定与郑重声明，请务必遵守。
+
+**ARTEX 仅供个人学习、代码研究与本地技术验证使用，不得用于对任何线上系统或网站发起实际测试。**
+
+### 允许使用范围
+
+- 仅可用于**阅读、学习与研究本项目源码**，以及在**本地隔离环境**中进行技术原理验证；
+- 适用于个人学习、学术研究、代码审阅等非攻击性用途。
+
+### 禁止事项
+
+- **严禁使用本工具对任何网站、线上服务或联网系统发起扫描、探测、利用或攻击**（无论是否获得授权、是否为自有资产）；
+- 严禁将本工具用于任何实际的渗透测试、攻防对抗或生产环境；
+- 严禁将本工具用于非法入侵、数据窃取、勒索、拒绝服务或任何破坏性、犯罪性活动；
+- 严禁利用本工具从事违反所在国家/地区法律法规的行为。
+
+### 合规责任
+
+使用者须自行遵守所在国家/地区关于网络安全、数据保护与计算机犯罪的全部法律法规（在中国大陆包括但不限于《网络安全法》《数据安全法》《个人信息保护法》及相关司法解释）。**因使用本工具产生的一切法律责任与后果，均由使用者自行承担。**
+
+### 免责声明
+
+本项目按“现状（AS IS）”提供，不附带任何明示或默示的担保。作者及贡献者不对使用本工具（无论使用方式是否得当）所导致的任何直接或间接损失、数据丢失、系统损坏或法律纠纷承担责任。**下载、安装或使用本项目，即表示你已阅读、理解并同意上述全部条款。**

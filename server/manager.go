@@ -249,12 +249,13 @@ type Manager struct {
 
 // Settings keys the UI toggles at runtime.
 const (
-	settingTrafficCapture   = "traffic_capture"
-	settingWebSearchOn      = "web_search_enabled"
-	settingWebSearchBackend = "web_search_backend"
-	settingBraveKey         = "brave_search_api_key"
-	settingTavilyKey        = "tavily_search_api_key"
-	settingWebSearchProxy   = "web_search_proxy"
+	settingTrafficCapture      = "traffic_capture"
+	settingAgentTrafficBinding = "agent_traffic_binding"
+	settingWebSearchOn         = "web_search_enabled"
+	settingWebSearchBackend    = "web_search_backend"
+	settingBraveKey            = "brave_search_api_key"
+	settingTavilyKey           = "tavily_search_api_key"
+	settingWebSearchProxy      = "web_search_proxy"
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
 	// only routes the search backend) and the per-profile LLM proxy.
@@ -270,8 +271,15 @@ const (
 	// 任务并发上限:开关 + 上限数。默认关闭;开启后默认上限 5(见 defaultConcurrencyLimit)。
 	settingConcurrencyOn    = "task_concurrency_enabled"
 	settingConcurrencyLimit = "task_concurrency_limit"
+	// 实验功能:noa 模型驱动上下文压缩(norma v0.4.0)。默认关闭——开启后平台接入的四类
+	// agent(planner/worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction。
+	// 每 run 读一次,切换只影响之后启动的 run。
+	settingNoaCompaction = "noa_compaction"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
+	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
+	// key, so it only works on an anthropic-format profile pointed at DeepSeek.
+	deepSeekWebSearchBackend = "deepseek"
 	// defaultWorkers is the concurrent work-agent count when the setting is unset.
 	defaultWorkers = 3
 	// defaultConcurrencyLimit is the simultaneous-running-task cap when the feature
@@ -354,6 +362,10 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	pg, err := pgdb.Open(dsn)
 	if err != nil {
 		return nil, err
+	}
+	if err := pg.RecoverFindingRetests(); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
@@ -480,6 +492,19 @@ func (m *Manager) SetLLMRecordEnabled(on bool) error {
 	return nil
 }
 
+// NoaCompactionEnabled reports whether the experimental noa context-compression
+// mechanism is on (默认关；settings.noa_compaction). Read per agent run via the
+// injected resolver, so a toggle takes effect on the next run without rebuild.
+func (m *Manager) NoaCompactionEnabled() bool {
+	return m.pg.GetBool(settingNoaCompaction, false)
+}
+
+// SetNoaCompaction persists the noa toggle. Effective on the next agent run —
+// the resolver reads it per run, so no rebuild is needed.
+func (m *Manager) SetNoaCompaction(on bool) error {
+	return m.pg.SetBool(settingNoaCompaction, on)
+}
+
 // LLMPoolEnabled reports whether LLM failover ("轮询") is on (默认关；
 // settings.llm_pool_enabled). Read when the provider chain is built (applyLLM),
 // so a change requires a rebuild — putSettings does that.
@@ -534,7 +559,26 @@ func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
 	if on && backend == "tavily" && strings.TrimSpace(tavilyKey) == "" {
 		on = false
 	}
-	return agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
+	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
+	if backend == deepSeekWebSearchBackend {
+		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = m.deepSeekSearchCreds()
+	}
+	return o
+}
+
+// deepSeekSearchCreds resolves the credentials the "deepseek" search backend
+// borrows from the active LLM profile (it has no key of its own). Whether that
+// profile can actually drive server-side search — DeepSeek exposes it only on
+// the Anthropic-format endpoint — is deliberately NOT validated here: the UI
+// states the requirement and the user decides. A profile that can't serve it
+// simply fails at search time (or at the settings page's 测试 button), which is
+// the same feedback every other backend gives for a bad key.
+func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
+	p, err := m.pg.ActiveProfile()
+	if err != nil || p == nil {
+		return "", "", ""
+	}
+	return p.BaseURL, p.APIKey, p.Model
 }
 
 // SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey, and
@@ -1749,6 +1793,21 @@ func (t *Task) NotifyGoal(texts []string) {
 	t.Notify()
 }
 
+// NotifyHint records that one OR MORE hints were added in a single add_hint call —
+// by the human via the main agent, or by cross-task orchestration — then wakes the
+// planner, so the next round is told "人新增了 N 条战略提示：…" and looks at them
+// directly instead of having to spot the new hint folded into the graph overview.
+// One call → one trigger event (a batched add_hint counts as one, not one per hint).
+func (t *Task) NotifyHint(texts []string) {
+	if len(texts) == 0 {
+		return
+	}
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts})
+	t.trigMu.Unlock()
+	t.Notify()
+}
+
 // NotifyGoalDeleted records that the human deleted a goal (via 总览的目标管理), then
 // wakes the planner so the next round spells out which goal was removed. The event
 // survives an early-returning terminal round (drain happens after the gate).
@@ -1779,11 +1838,13 @@ func (t *Task) NotifyGoalEdited(oldText, newText string) {
 
 // NotifyCancelled records that the human deleted intentID (reason = 删除原因), then
 // wakes the planner so the next round spells out which intent was removed and why.
-// The intent is stopped (not deleted); the reason is attached to it as a fact.
-func (t *Task) NotifyCancelled(intentID int64, reason string) {
+// summary is the intent's text captured before deletion — needed for hard delete,
+// where the node is gone by the time the planner reads the trigger. Applies to both
+// soft (state='deleted') and hard (physical cascade) delete.
+func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 	if intentID > 0 {
 		t.trigMu.Lock()
-		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "cancelled", IntentID: intentID, Detail: reason})
+		t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "cancelled", IntentID: intentID, Summary: summary, Detail: reason})
 		t.trigMu.Unlock()
 	}
 	t.Notify()

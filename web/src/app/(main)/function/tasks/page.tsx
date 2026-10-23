@@ -44,6 +44,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
 import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
@@ -121,6 +122,7 @@ import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
+  AssetInterceptRuleInput,
   ChatAttachment,
   Company,
   DeleteTaskOptions,
@@ -948,6 +950,9 @@ export default function TasksPage() {
                       onSort={sortTasksBy}
                     />
                     <TableHead className="text-center">目标进度</TableHead>
+                    <TableHead className="text-center" title="严重 / 高 / 中 / 低">
+                      漏洞 <span className="text-muted-foreground font-normal">严/高/中/低</span>
+                    </TableHead>
                     <TableHead className="text-center">运行中 Worker</TableHead>
                     <SortableTaskHead
                       field="created"
@@ -1191,7 +1196,7 @@ const TaskRow = React.memo(function TaskRow({
           {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="已置顶" />}
         </div>
       </TableCell>
-      <TableCell className="text-muted-foreground max-w-xs">
+      <TableCell className="text-muted-foreground max-w-40">
         <Link
           href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
           className="block truncate rounded-sm hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -1200,7 +1205,9 @@ const TaskRow = React.memo(function TaskRow({
           {task.description}
         </Link>
       </TableCell>
-      <TableCell className="text-muted-foreground max-w-xs truncate">{task.goal}</TableCell>
+      <TableCell className="text-muted-foreground max-w-40 truncate" title={task.goal}>
+        {task.goal}
+      </TableCell>
       <TableCell>
         <StatusBadge domain="task" value={task.status} dot />
       </TableCell>
@@ -1210,6 +1217,27 @@ const TaskRow = React.memo(function TaskRow({
         ) : (
           <span className="text-muted-foreground">—</span>
         )}
+      </TableCell>
+      <TableCell className="text-center text-xs tabular-nums">
+        {(() => {
+          const f = task.findings;
+          const total = f ? f.critical + f.high + f.medium + f.low : 0;
+          if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
+          const seg = (n: number, cls: string) => (
+            <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
+          );
+          return (
+            <span className="font-medium whitespace-nowrap" title="严重 / 高 / 中 / 低">
+              {seg(f.critical, "text-rose-600 dark:text-rose-400")}
+              <span className="text-muted-foreground">/</span>
+              {seg(f.high, "text-red-600 dark:text-red-400")}
+              <span className="text-muted-foreground">/</span>
+              {seg(f.medium, "text-amber-600 dark:text-amber-400")}
+              <span className="text-muted-foreground">/</span>
+              {seg(f.low, "text-slate-600 dark:text-slate-400")}
+            </span>
+          );
+        })()}
       </TableCell>
       <TableCell className="text-center text-xs tabular-nums">
         {task.in_flight && task.in_flight > 0 ? (
@@ -3059,6 +3087,7 @@ function CreateTaskSheet({
   const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner 心跳(分钟);默认10,下限10(与后端一致)
   const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 创建时下发种子意图,worker 免等首轮 planner 直接开跑;默认关闭,走标准先规划再执行
   const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 资产覆盖度功能;默认开。关闭=不计算/展示覆盖度、不累积范围、隐藏范围类工具(company 关联不受影响)
+  const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 任务级资产拦截规则(仅本任务生效,不进全局表)
   // 方式1 文件上传:建任务前把文件暂存到 drafts/<draftId>/uploads/,拿回绝对路径追加进描述。
   const [uploading, setUploading] = React.useState(false);
   const [uploadCount, setUploadCount] = React.useState(0);
@@ -3125,6 +3154,9 @@ function CreateTaskSheet({
         seedFirstIntent,
         planHeartbeatSeconds: heartbeatSec,
         coverageEnabled,
+        interceptRules: interceptRules
+          .map((r) => ({ ...r, pattern: r.pattern.trim() }))
+          .filter((r) => r.pattern !== ""),
       });
       toast.success("任务已创建");
       setName("");
@@ -3139,6 +3171,7 @@ function CreateTaskSheet({
       setHeartbeatMin("10");
       setSeedFirstIntent(false);
       setCoverageEnabled(true);
+      setInterceptRules([]);
       setUploadCount(0);
       draftIdRef.current = "";
       setOpen(false);
@@ -3174,11 +3207,15 @@ function CreateTaskSheet({
             <TaskTemplateControls
               description={description}
               goal={goal}
+              categoryID={categoryID}
+              interceptRules={interceptRules}
               selectedTemplateID={selectedTemplateID}
               onSelectedTemplateIDChange={setSelectedTemplateID}
               onApply={(template) => {
                 setDescription(template.description);
                 setGoal(template.goal);
+                setCategoryID(template.category_id ?? undefined);
+                setInterceptRules(template.intercept_rules ?? []);
                 setUploadCount(0);
               }}
               portalContainer={sheetContentRef}
@@ -3272,6 +3309,13 @@ function CreateTaskSheet({
               <FieldDescription>
                 创建任务时会将所选企业当前已有资产加入“测试资产”，并将域名、IP、CIDR、ICP 和企业关键词提供给 Agent
                 作为范围上下文；不会自动生成意图或强制改变执行目标。
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="task-intercept-rules">任务级资产拦截 / 允许规则（可选）</FieldLabel>
+              <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
+              <FieldDescription>
+                仅对本任务生效，不写入全局规则。判定顺序：先按「拦截」规则（含全局）匹配，命中即禁止测试；未命中且本任务配置了「允许」规则时，须命中某条允许规则才放行，否则同样不允许测试；未配置任何允许规则则不启用白名单。
               </FieldDescription>
             </Field>
             <Field>

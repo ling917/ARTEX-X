@@ -23,6 +23,7 @@ export interface Task {
   queued?: boolean;
   active?: boolean;
   in_flight?: number;
+  findings?: { critical: number; high: number; medium: number; low: number }; // 已登记漏洞数(按严重度分档)
   last_activity?: string;
   stalled?: boolean;
   goals_total?: number;
@@ -53,6 +54,8 @@ export interface TaskTemplate {
   name: string;
   description: string;
   goal: string;
+  category_id?: number | null; // 预设分类；null/缺省=无
+  intercept_rules?: AssetInterceptRuleInput[]; // 预设的任务级拦截/允许规则
   created_at: string;
   updated_at: string;
 }
@@ -401,12 +404,12 @@ export interface Company {
 }
 
 // ---- Exploration graph (per task) ----
-export type ExploreKind = "task" | "begin" | "goal" | "intent" | "fact" | "finding" | "hint";
+export type ExploreKind = "task" | "begin" | "goal" | "intent" | "fact" | "finding" | "hint" | "digest";
 export type GoalState = "open" | "met" | "abandoned";
 export type IntentState = "open" | "running" | "paused" | "done" | "blocked" | "exhausted" | "stopped";
 export type FindingState = "confirmed" | "dismissed";
 export type HintState = "active" | "consumed";
-export type ExploreRel = "spawns" | "derived_from" | "yields" | "proves";
+export type ExploreRel = "spawns" | "derived_from" | "yields" | "proves" | "covers";
 
 export interface TaskNode {
   id: string;
@@ -418,6 +421,29 @@ export interface TaskNode {
   ts: string;
   source_task_id?: string;
   inherited?: boolean;
+  delete_reason?: string; // 意图假删除(state='deleted')时的删除原因
+}
+
+// 播报板一页:按创建顺序分页的节点 + 这一页涉及的边 + 边另一端的节点(refs,按 id 索引),
+// 这样每条播报都能说清「从哪来、产出了什么」,而不用把整张图拉下来。
+export interface ExplorationNodePage {
+  items: TaskNode[];
+  total: number;
+  page: number;
+  size: number;
+  edges: Edge[];
+  refs: Record<string, TaskNode>;
+  // 节点 id → 该节点锚定的资产(播报板展开时顺带展示,含本页节点与其邻居)。
+  assets: Record<string, FindingAsset[]>;
+}
+
+export interface ExplorationNodeQuery {
+  page?: number;
+  size?: number;
+  kinds?: ExploreKind[];
+  states?: string[];
+  q?: string;
+  order?: "asc" | "desc";
 }
 
 // 目标管理卡片用的目标(后端已把 payload 拆成 text/vulnclass)。
@@ -443,12 +469,13 @@ export interface TaskConstraint {
 // ---- Findings ----
 export type Severity = "critical" | "high" | "medium" | "low";
 
-// 漏洞处置状态:待处理 / 处理中 / 已确认 / 已处理 / 误报 / 忽略 / 重复 / 风险接受。
+// 漏洞处置状态:待处理 / 处理中 / 已确认 / 已处理 / 已修复 / 误报 / 忽略 / 重复 / 风险接受。
 export type FindingStatus =
   | "pending"
   | "in_progress"
   | "confirmed"
   | "resolved"
+  | "fixed"
   | "false_positive"
   | "ignored"
   | "duplicate"
@@ -462,6 +489,10 @@ export interface FindingAsset {
 }
 
 export interface Finding {
+  traffic_count?: number;
+  evidence_version?: number;
+  report_evidence_version?: number;
+  report_stale?: boolean;
   id: string;
   finding_id?: string; // 独立 findings 表的行 id,状态更新的句柄(任务内旧节点可能缺失)
   vulnclass: string;
@@ -622,6 +653,7 @@ export interface Activity {
   };
   source_task_id?: string;
   inherited?: boolean;
+  main_seg?: number; // main-agent conversation segment (present only on worker="mainagent" rows)
   // token usage (present only on kind='result')
   input_tokens?: number;
   output_tokens?: number;
@@ -681,8 +713,31 @@ export interface AgentTrigger {
 }
 
 // ---- Conversations (chat page) ----
+export interface ActiveFindingRetest {
+  id: number;
+  finding_id: string;
+  conversation_id: number;
+  status: "pending" | "running";
+}
+
+export interface FindingRetest {
+  id: number;
+  finding_id: number;
+  conversation_id: number | null;
+  status: "pending" | "running" | "completed" | "failed" | "stopped";
+  verdict: "" | "reproduced" | "fixed" | "inconclusive";
+  notes: string;
+  summary: string;
+  evidence: string;
+  error: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
 export interface Conversation {
   id: number;
+  running?: boolean; // live server state, returned with the conversation list
   agent_key: string;
   title: string;
   llm_profile_id?: number;
@@ -703,7 +758,7 @@ export interface LogLine {
 }
 
 export type SessionRole = "mainagent" | "planner" | "worker" | "system";
-export type SessionStatus = "running" | "paused" | "done" | "blocked" | "exhausted" | "pending" | "stopped";
+export type SessionStatus = "running" | "paused" | "done" | "blocked" | "exhausted" | "pending" | "stopped" | "deleted";
 
 // Daily token aggregate bucket (GET /api/tokens/daily).
 export interface DailyTokenBucket {
@@ -801,6 +856,7 @@ export interface Session {
   intent_id?: string;
   source_task_id?: string;
   inherited?: boolean;
+  seg?: number; // main-agent session: which conversation segment (0 = original)
 }
 
 // ---- Security ----
@@ -854,11 +910,12 @@ export interface TrafficHost {
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
+  agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
-  web_search_backend: string; // "ddgs" | "brave-free" | "tavily"
+  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
@@ -882,6 +939,87 @@ export interface Settings {
   // 操作约束注入范围(默认都开):把任务的 allow/deny 约束拼进对应 agent 的系统提示。
   constraints_inject_planner?: boolean;
   constraints_inject_worker?: boolean;
+  // 实验功能:noa 模型驱动上下文压缩(默认关)。开启后平台接入的四类 agent(planner/
+  // worker/主 agent/对话)由 noa 接管上下文压缩,取代内置 compaction;每 run 读一次,对
+  // 之后启动的 run 生效。
+  noa_compaction?: boolean;
+  // ---- 漏洞 IM 推送（渠道本身是独立资源，见 /api/notify/*，这里只有三项全局配置）----
+  notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
+  notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
+  notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+}
+
+// ---- 漏洞 IM 推送 ----
+
+// NotificationFilter 是渠道的过滤条件，字段全部可选，缺省即不过滤。
+// 后端对所有字段都不加校验：配置畸形时按「命中」处理（宁可多推不可漏推）。
+export interface NotificationFilter {
+  min_severity?: string; // "" | low | medium | high | critical
+  task_ids?: number[]; // 空=不限；非空则要求与漏洞所属任务有交集
+  asset_ids?: number[]; // 空=不限；非空则要求与漏洞锚定资产有交集
+  vulnclass_include?: string[]; // 空=全收；非空则要求漏洞类型命中任一关键词（大小写不敏感子串）
+  vulnclass_exclude?: string[]; // 命中任一关键词即排除（排除优先于包含）
+  on_status_change?: boolean; // 是否也接收漏洞处置状态变更事件
+}
+
+// NotificationChannel 是一个渠道实例。config 的字段随 kind 而异，
+// 且凭据字段在读取时被替换成 "__masked__" 开头的掩码值——原样回传即表示「不改」。
+export interface NotificationChannel {
+  id: number;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  mode: "realtime" | "digest";
+  config: Record<string, unknown>;
+  filter: NotificationFilter;
+  rate_per_min: number;
+  created_at: string;
+  updated_at: string;
+  // secret_keys 由后端按渠道类型给出，前端据此渲染密码框与「留空即不改」提示，
+  // 不硬编码任何渠道知识。
+  secret_keys: string[];
+}
+
+// NotificationKind 是 /api/notify/meta 返回的渠道类型元数据。
+export interface NotificationKind {
+  kind: string;
+  default_rate_per_min: number;
+  secret_keys: string[];
+}
+
+export interface NotificationMeta {
+  kinds: NotificationKind[];
+  enabled: boolean;
+  public_base_url: string;
+  digest_interval_min: string;
+  defaults: { digest_interval_min: number };
+  stats: {
+    channels: number;
+    channels_on: number;
+    pending: number;
+    failed: number;
+    sent_today: number;
+    backlog_age_ms: number;
+  };
+}
+
+// NotificationDelivery 是一条投递记录，用于投递历史与失败重发。
+export interface NotificationDelivery {
+  id: number;
+  finding_id: string;
+  event_kind: string; // finding_created | finding_status_changed
+  channel_id: number;
+  channel_name: string;
+  channel_kind: string;
+  state: "pending" | "sending" | "sent" | "failed" | "skipped";
+  attempts: number;
+  last_error: string;
+  batch_id?: number;
+  created_at: string;
+  sent_at?: string;
+  next_attempt_at: string;
+  title: string;
+  severity: string;
 }
 
 // ---- LLM config ----
@@ -916,6 +1054,32 @@ export interface LLMProfile {
   // 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
   // ""=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
   session_header_key?: string;
+  // 本配置对重试的覆盖（建连/空响应/同 provider 安全窗口）。留空/全 0 = 跟随全局策略。
+  retry?: LLMRetryOverride;
+}
+
+// ---- LLM 重试策略 ----
+// 一层重试的两个旋钮。两者都是「0 = 未配置」：
+//   attempts    0=用默认次数 | -1=关闭该层重试 | >0=重试次数
+//   interval_ms 0=用默认的指数退避 | >0=改用这个固定毫秒间隔
+export interface LLMRetryRule {
+  attempts: number;
+  interval_ms: number;
+}
+
+// 单个 LLM 配置能覆盖的三层（都是「跟着端点走」的重试）。
+export interface LLMRetryOverride {
+  connect: LLMRetryRule; // 建连重试：连接重置/超时/429/5xx，流开始前
+  empty: LLMRetryRule; // 空响应重试：完成但没有任何内容（仅 openai 格式）
+  stream: LLMRetryRule; // 同 provider 安全窗口重试：未交付输出前的断流重放
+}
+
+// 全局策略 = 上面三层的默认值 + 两层只有全局的：
+//   breaker 轮询熔断（attempts=连续几次瞬时失败熔断，interval_ms=固定冷却时长）
+//   intent  意图重跑（worker 以 model_error 收场后整条意图重跑）
+export interface LLMRetryPolicy extends LLMRetryOverride {
+  breaker: LLMRetryRule;
+  intent: LLMRetryRule;
 }
 
 // ---- LLM 轮询（故障转移）----
@@ -1007,12 +1171,13 @@ export interface AgentDetail {
 export interface MCPServer {
   id: number;
   name: string;
-  transport: "stdio" | "http";
+  transport: "stdio" | "http" | "sse";
   command?: string;
   args: string[];
   env: Record<string, string>;
   url?: string;
   enabled: boolean;
+  insecure?: boolean; // http: skip TLS cert verification (self-signed servers)
   tools?: string[]; // mcp_tools_cache (names only, for the count)
 }
 
@@ -1106,7 +1271,42 @@ export interface InterceptRule {
   updated_at: string;
 }
 
+// ---- Asset Intercept Rules（资产拦截：全局黑名单） ----
+export type AssetInterceptKind =
+  | "exact_domain"
+  | "exact_ip"
+  | "exact_url"
+  | "fuzzy_domain"
+  | "fuzzy_ip"
+  | "fuzzy_url"
+  | "cidr";
+
+// action 仅用于任务级规则：block=拦截(禁止测试) allow=允许(白名单)。
+export type AssetInterceptAction = "block" | "allow";
+
+// 任务级资产拦截/允许规则的录入项（创建任务、任务详情编辑使用）。
+export interface AssetInterceptRuleInput {
+  action: AssetInterceptAction;
+  kind: AssetInterceptKind;
+  pattern: string;
+  note: string;
+  enabled: boolean;
+}
+
+export interface AssetInterceptRule {
+  id: number;
+  enabled: boolean;
+  action?: AssetInterceptAction; // 全局规则不带此字段（恒为拦截）；任务级规则区分 block/allow
+  kind: AssetInterceptKind;
+  pattern: string;
+  note: string;
+  builtin: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface InterceptPending {
+  decision_source?: "rule" | "model" | "unknown" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1130,6 +1330,27 @@ export interface JudgeConfig {
   fail_action: "allow" | "ask" | "deny"; // 模型出错/超时/不可解析时的回退
   ask_timeout_seconds: number; // 模型判 ask 转人工后的审批等待超时
   ask_timeout_action: "allow" | "deny"; // 审批超时后的默认动作
+}
+
+// JudgeUsage: 模型兜底审批(judge 通道)的累计 token 用量 + 近 N 天每日序列。
+export interface JudgeDayUsage {
+  date: string; // YYYY-MM-DD (UTC)
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+export interface JudgeUsage {
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  daily: JudgeDayUsage[];
+}
+
+export interface InterceptApprovalFilter {
+  status?: InterceptPending["status"];
+  decision_source?: "rule" | "model" | "unknown";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1219,4 +1440,297 @@ export interface LLMRecordDetail extends LLMRecordItem {
 export interface LLMTask {
   task_id: string;
   count: number;
+}
+
+// The exact JSON sent to the review model, retained for all model verdicts.
+export interface InterceptReviewInput {
+  version: number;
+  background?: {
+    // worker_summary is retained only for immutable v2/v3 snapshots.
+    source: "user_message" | "worker_summary";
+    text: string;
+    truncated?: boolean;
+  };
+  // Version 1 snapshots are immutable and remain readable in historical audits.
+  task?: {
+    task_id: number;
+    description: string;
+    goal: string;
+    constraints: { id: number; kind: string; text: string; origin: string; created_at: number }[];
+    truncated?: boolean;
+  };
+  working_directory?: string;
+  worker_intent?: string;
+  turn_input?: string;
+  background_truncated?: boolean;
+  // Legacy v1/v2 snapshots only; v3 never sends execution history.
+  history?: {
+    tool_use_id: string;
+    tool: string;
+    arguments_preview: string;
+    result: string;
+    status: "succeeded" | "failed";
+    truncated?: boolean;
+  }[];
+  history_truncated?: boolean;
+  correlation?: "exact" | "ambiguous" | "unavailable";
+  tool_name: string;
+  arguments: Record<string, unknown>;
+}
+
+// Immutable review snapshot plus separately recorded execution outcome.
+export interface InterceptAudit {
+  model_input?: InterceptReviewInput;
+  model_input_digest?: string;
+  run_id?: string;
+  tool_use_id?: string;
+  correlation: "exact" | "ambiguous" | "unavailable";
+  input_digest: string;
+  user_message: string;
+  user_truncated?: boolean;
+  context:
+    | { kind: string; tool?: string; tool_use_id?: string; text: string; is_error?: boolean; truncated?: boolean }[]
+    | null;
+  context_truncated?: boolean;
+  captured_at: string;
+  model_fallback?: boolean;
+  initial_action: "allow" | "ask" | "deny";
+  initial_reason: string;
+  effective_action?: "allow" | "deny";
+  decision_reason?: string;
+  rule_name?: string;
+  config_digest?: string;
+  profile_id?: number;
+  execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
+  output?: string;
+  output_truncated?: boolean;
+  execution_ended_at?: string;
+}
+export interface InterceptDetail extends InterceptApprovalRow {
+  audit: InterceptAudit | null;
+}
+
+export type TrafficEvidenceRole = "baseline" | "proof" | "verification" | "supporting";
+export interface TrafficEvidenceRef {
+  traffic_id: string;
+  role?: TrafficEvidenceRole;
+  note?: string;
+}
+export interface TrafficEvidenceSnapshot {
+  id: string;
+  source_traffic_id: string;
+  captured_at: number;
+  url: string;
+  method: string;
+  status: number;
+  content_type: string;
+  req_head?: string;
+  resp_head?: string;
+  req_hash: string;
+  resp_hash: string;
+  req_len: number;
+  resp_len: number;
+}
+export interface FindingTrafficBinding {
+  id: string;
+  finding_id: string;
+  snapshot_id: string;
+  role: TrafficEvidenceRole;
+  note: string;
+  position: number;
+  created_at: string;
+  snapshot: TrafficEvidenceSnapshot;
+}
+export interface FindingTraffic {
+  finding_id: string;
+  version: number;
+  report_version: number;
+  bindings: FindingTrafficBinding[];
+}
+export interface EvidenceBodyPreview {
+  content: string;
+  offset: number;
+  total: number;
+  next_offset: number;
+  truncated: boolean;
+  binary: boolean;
+}
+export interface FindingTrafficDetail {
+  binding: FindingTrafficBinding;
+  request: EvidenceBodyPreview;
+  response: EvidenceBodyPreview;
+}
+
+/** GET /api/update/check —— 当前版本与 GitHub 最新正式版的比较结果。 */
+export interface UpdateCheck {
+  /** 当前运行的版本；开发构建为 "dev" 或 git describe 的带后缀形式。 */
+  current: string;
+  /** 运行形态。docker 下换装只作用于容器可写层，重建容器会退回镜像版本。 */
+  mode: "docker" | "binary";
+  os: string;
+  arch: string;
+  repo: string;
+  /** 是否存在可回滚的上一版本（artex.old）。 */
+  has_backup: boolean;
+  /** 本次启动时自更新自举的结论（换装失败 / 已回滚等），无事发生时为空。 */
+  boot_notice?: string;
+  rolled_back?: boolean;
+  /** 查询 GitHub 失败时给出原因，此时下面的字段都不会有。 */
+  error?: string;
+  latest?: string;
+  notes?: string;
+  html_url?: string;
+  published_at?: string;
+  /** 当前平台对应的发布包名，以及该 Release 是否真的带了它。 */
+  asset?: string;
+  asset_available?: boolean;
+  size?: number;
+  has_update?: boolean;
+  /** 双方版本号是否可比较；开发构建为 false，此时禁用一键更新。 */
+  comparable?: boolean;
+  /** comparable 为 false 时的说明。 */
+  reason?: string;
+}
+
+/** /api/update/stream 推送的一条更新进度。 */
+export interface UpdateProgress {
+  phase: "idle" | "downloading" | "verifying" | "extracting" | "staged" | "failed";
+  /** 仅下载阶段有意义（0-100）；其余阶段为 -1。 */
+  percent: number;
+  message: string;
+  version?: string;
+  error?: string;
+}
+
+// Original execution selected from an approval, never submitted to the reviewer.
+export interface InterceptExecution {
+  conversation_id: number | null;
+  task_id: string | null;
+  session: string;
+  seq: number;
+  items: Activity[];
+}
+
+// ---------------------------------------------------------------------------
+// WebShell 连接管理（Agent 自动登记 / 手动添加）
+// ---------------------------------------------------------------------------
+
+export type WebShellType = "simple" | "behinder" | "godzilla" | "custom";
+export type WebShellLang = "php" | "jsp" | "asp" | "aspx";
+export type WebShellMode = "raw" | "php" | "php_eval" | "jsp_eval" | "asp_eval" | "aspx_eval";
+export type WebShellStatus = "unknown" | "ok" | "fail";
+
+export interface WebShell {
+  id: number;
+  name: string;
+  url: string;
+  type: WebShellType | string;
+  lang: WebShellLang | string;
+  mode: WebShellMode | string;
+  password_set: boolean;
+  method: string;
+  param: string;
+  headers: Record<string, string>;
+  body_template: string;
+  response_regex: string;
+  response_b64: boolean;
+  encoding: string;
+  transport: string;
+  insecure: boolean;
+  timeout_seconds: number;
+  os_type: string;
+  task_id?: number;
+  task_name?: string;
+  target: string;
+  notes: string;
+  status: WebShellStatus | string;
+  last_error: string;
+  last_checked_at?: string;
+  last_used_at?: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WebShellDetail extends WebShell {
+  password: string;
+}
+
+export interface WebShellInput {
+  name: string;
+  url: string;
+  type: WebShellType;
+  lang: WebShellLang;
+  mode: WebShellMode;
+  password?: string;
+  method: "GET" | "POST";
+  param: string;
+  headers: Record<string, string>;
+  body_template: string;
+  response_regex: string;
+  response_b64: boolean;
+  encoding: string;
+  insecure: boolean;
+  timeout_seconds: number;
+  target: string;
+  notes: string;
+}
+
+export interface WebShellTestResult {
+  ok: boolean;
+  output?: string;
+  os_type?: string;
+  transport?: string;
+  http_status?: number;
+  duration_ms: number;
+  error?: string;
+}
+
+export interface WebShellExecResult {
+  output: string;
+  http_status: number;
+  duration_ms: number;
+  output_bytes: number;
+  truncated: boolean;
+  transport?: string;
+}
+
+export interface WebShellInfo {
+  os_type: string;
+  user: string;
+  hostname: string;
+  os: string;
+  pwd: string;
+  ip: string;
+  raw: string;
+  transport?: string;
+  duration_ms: number;
+}
+
+export interface WebShellFileEntry {
+  name: string;
+  path: string;
+  dir: boolean;
+  size: number;
+  mtime: number;
+}
+
+export interface WebShellFileListing {
+  path: string;
+  parent: string;
+  os_type: string;
+  transport?: string;
+  entries: WebShellFileEntry[];
+  raw?: string;
+}
+
+export interface WebShellFileData {
+  path: string;
+  size: number;
+  offset: number;
+  length: number;
+  data_b64: string;
+  binary: boolean;
+  truncated: boolean;
+  os_type: string;
 }

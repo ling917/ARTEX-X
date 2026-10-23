@@ -14,6 +14,7 @@ package intercept
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -117,7 +118,7 @@ func (p *pendingManager) remove(id int64) {
 // as a Decision (Action ∈ allow|ask|deny; empty Action means the reply could not
 // be parsed). It is injected by the server layer so the intercept package stays
 // free of any llm dependency. profileID == 0 means "use the active/default profile".
-type Reviewer func(ctx context.Context, profileID int64, prompt, tool, command string) (Decision, error)
+type Reviewer func(ctx context.Context, profileID int64, prompt string, input ReviewInput) (Decision, error)
 
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
@@ -282,12 +283,18 @@ func (i *Interceptor) SetEnabledTools(tools []string) error {
 
 // Decision is the outcome of a successful rule match.
 type Decision struct {
-	Action         string // "allow" | "deny" | "ask"
-	Message        string
-	RuleID         int64
-	TimeoutEnabled bool
-	TimeoutSeconds int
-	TimeoutAction  string // "deny" | "allow"
+	ModelInput       json.RawMessage
+	ModelInputDigest string
+	ModelFallback    bool
+	RuleName         string
+	ConfigDigest     string
+	ProfileID        int64
+	Action           string // "allow" | "deny" | "ask"
+	Message          string
+	RuleID           int64
+	TimeoutEnabled   bool
+	TimeoutSeconds   int
+	TimeoutAction    string // "deny" | "allow"
 }
 
 // --- LLM fallback judge ---
@@ -419,7 +426,7 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 // keeps the current behavior: allow). On model error or an unparseable reply it
 // falls back to the configured FailAction. Ask verdicts carry the human-approval
 // timeout so the existing HandleAsk consumes them unchanged.
-func (i *Interceptor) Judge(ctx context.Context, tool, command string) (Decision, bool) {
+func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool) {
 	cfg := i.judgeConfig()
 	i.mu.RLock()
 	rv := i.reviewer
@@ -435,18 +442,40 @@ func (i *Interceptor) Judge(ctx context.Context, tool, command string) (Decision
 		defer cancel()
 	}
 
-	out, err := rv(cctx, cfg.ProfileID, cfg.Prompt, tool, command)
+	input, contextErr := BuildReviewInput(cctx, tool, arguments)
+	cfg.Prompt = EffectiveJudgePrompt(cfg.Prompt)
+	var out Decision
+	var err error
+	var modelInput []byte
+	if contextErr != nil {
+		// Invalid current arguments cannot be reviewed faithfully, regardless of
+		// the configured model-failure strategy. A human must resolve the input.
+		out = Decision{Action: "ask", ModelFallback: true, Message: "审查上下文不完整，需要人工确认：" + contextErr.Error()}
+	} else {
+		modelInput, _ = json.Marshal(input)
+		out, err = rv(cctx, cfg.ProfileID, cfg.Prompt, input)
+	}
 	if err != nil {
-		out = Decision{Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
+		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型审批失败,按失败策略处理: " + err.Error()}
 	}
 	switch out.Action {
 	case "allow", "ask", "deny":
 		// valid verdict
 	default:
-		out = Decision{Action: cfg.FailAction, Message: "模型输出无法解析,按失败策略处理"}
+		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "模型输出无法解析,按失败策略处理"}
 	}
 	// A model verdict never carries a rule; keep RuleID 0 (→ NULL) for history.
 	out.RuleID = 0
+	if len(modelInput) > 0 {
+		out.ModelInput = modelInput
+		out.ModelInputDigest = digestInput(modelInput)
+	}
+	if out.ProfileID != 0 {
+		cfg.ProfileID = out.ProfileID
+	}
+	out.ProfileID = cfg.ProfileID
+	configJSON, _ := json.Marshal(cfg)
+	out.ConfigDigest = digestInput(configJSON)
 	if out.Message == "" {
 		out.Message = "[模型] " + judgeActionLabel(out.Action)
 	} else if !strings.HasPrefix(out.Message, "[模型]") {
@@ -487,7 +516,9 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 			if msg == "" {
 				msg = defaultMessage(r.Action, r.Name)
 			}
+			configJSON, _ := json.Marshal(r.InterceptRule)
 			return Decision{
+				RuleName: r.Name, ConfigDigest: digestInput(configJSON),
 				Action:         r.Action,
 				Message:        msg,
 				RuleID:         r.ID,
@@ -527,15 +558,19 @@ func defaultMessage(action, name string) string {
 	}
 }
 
-// Log records an allow/deny rule match into intercept_pending as an ALREADY-decided
+// Log records an allow/deny rule or model decision into intercept_pending as an ALREADY-decided
 // row (status = "allowed" | "denied"), for observability. Unlike HandleAsk it does NOT
-// block and needs no user action — it just makes every rule hit visible on the history
+// block and needs no user action — it makes explicit review decisions visible on the history
 // page (GET /api/intercept/history) and the task's intercept list. Best-effort: a DB
 // error is swallowed so logging never changes the tool call's outcome. The pending list
 // (status='pending') is unaffected, so it still shows only asks awaiting a decision.
 func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, status string) {
 	taskID, agentName := taskInfoFromCtx(ctx)
-	_, _ = i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message)
+	audit := auditFor(ctx, dec, input, status)
+	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, audit)
+	if err == nil {
+		i.bindResult(ctx, id, audit)
+	}
 }
 
 // HandleAsk creates a pending approval record and blocks until the user decides
@@ -551,9 +586,20 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 	taskID, agentName := taskInfoFromCtx(ctx)
 	taskEmit := taskEmitFromCtx(ctx)
 
-	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, input, dec.Message)
+	audit := auditFor(ctx, dec, input, "pending")
+	pendingID, err := i.db.CreateInterceptPending(ruleID, convID, taskID, agentName, toolName, input, dec.Message, audit)
 	if err != nil {
 		return false
+	}
+
+	i.bindResult(ctx, pendingID, audit)
+	ch := i.pending.add(pendingID)
+	defer i.pending.remove(pendingID)
+	// Polling clients can decide after INSERT commits but before the channel is
+	// registered. Re-read after registration so that decision cannot be lost;
+	// later decisions will be delivered through ch.
+	if saved, err := i.db.GetInterceptDetail(pendingID); err == nil && saved != nil && saved.Status != "pending" {
+		return saved.Status == "allowed" || (saved.Audit != nil && saved.Audit.EffectiveAction == "allow")
 	}
 
 	detail, _ := json.Marshal(map[string]any{
@@ -576,16 +622,14 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		taskEmit(activity)
 	}
 
-	ch := i.pending.add(pendingID)
-	defer i.pending.remove(pendingID)
-
 	if !dec.TimeoutEnabled {
 		// No timeout: wait indefinitely until user decides or worker stops.
 		select {
 		case allowed := <-ch:
 			return allowed
 		case <-ctx.Done():
-			_ = i.db.DecideInterceptPending(pendingID, "denied")
+			_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
+			_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
 			return false
 		}
 	}
@@ -601,13 +645,27 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 		return allowed
 	case <-timer.C:
 		allowed := dec.TimeoutAction == "allow"
-		_ = i.db.DecideInterceptPending(pendingID, "timeout")
+		action := "deny"
+		if allowed {
+			action = "allow"
+		}
+		resolved, err := i.db.ResolveIntercept(pendingID, "timeout", action, "审批超时，按超时策略处理")
+		if err != nil {
+			return false
+		}
+		if !resolved {
+			detail, err := i.db.GetInterceptDetail(pendingID)
+			return err == nil && detail != nil && (detail.Status == "allowed" || (detail.Audit != nil && detail.Audit.EffectiveAction == "allow"))
+		}
 		return allowed
 	case <-ctx.Done():
-		_ = i.db.DecideInterceptPending(pendingID, "denied")
+		_, _ = i.db.ResolveIntercept(pendingID, "denied", "deny", "工作已取消")
+		_ = i.db.CompleteIntercept(pendingID, audit.RunID, audit.ToolUseID, "not_executed", "执行前工作已取消", false)
 		return false
 	}
 }
+
+var ErrAlreadyDecided = errors.New("审批已处理或不存在，请刷新记录")
 
 // Decide resolves a pending request. Called by the HTTP decide endpoint.
 func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
@@ -615,8 +673,16 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	if allowed {
 		status = "allowed"
 	}
-	if err := i.db.DecideInterceptPending(pendingID, status); err != nil {
+	action, reason := "deny", "人工拒绝执行"
+	if allowed {
+		action, reason = "allow", "人工允许执行"
+	}
+	resolved, err := i.db.ResolveIntercept(pendingID, status, action, reason)
+	if err != nil {
 		return err
+	}
+	if !resolved {
+		return ErrAlreadyDecided
 	}
 	i.pending.resolve(pendingID, allowed)
 	return nil

@@ -210,6 +210,7 @@ func seedPrompts(pg *db.DB) {
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
 	// custom tools (system=false, added via the UI) survive restarts.
@@ -304,6 +305,19 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				}
 			}
 		}
+		// 拿到目标 WebShell 时自动登记的入口提示：只在 agent 确实绑定了
+		// webshell_save 时追加，避免指向不存在的工具。
+		if row, ok := byKey["webshell_save"]; ok && row.Enabled && contains(row.Agents, agentKey) {
+			note := "\n\n如果你通过漏洞利用/文件上传在目标上拿到了 WebShell（PHP/JSP/ASP 一句话、冰蝎、哥斯拉、自定义请求马），" +
+				"用 webshell_save 登记它的 URL/类型/密码；用户可在「WebShell」页面直接连接（终端、文件管理、信息面板），" +
+				"你也可以用 webshell_exec 继续在目标上执行命令。"
+			for i, t := range out {
+				if t.Name() == "Bash" {
+					out[i] = agent.DecorateTool(t, t.Description()+note, t.InputSchema())
+					break
+				}
+			}
+		}
 		// interactive shell: gated purely by the agent's interactive_shell flag (like
 		// web_search), NOT by tools-table binding. When on, inject the 5 shell_* tools
 		// and COUPLE the Bash description addendum so it points at shell_open — and never
@@ -336,6 +350,12 @@ func contains(ss []string, v string) bool {
 // (real AssetStore, nil ExplorationStore, taskID=0). Used by ToolResolve to inject
 // domain tools into agents (Auto, custom) that don't own a per-task ToolSet.
 // nil as → returns nil (no injection, graceful degradation).
+//
+// The nil ExplorationStore is deliberate — these instances are task-less by
+// construction — so every tool here must tolerate it. Asset/company tools do
+// (they only need the AssetStore); the exploration-graph tools refuse with a
+// clear message via ToolSet.needExploration. Binding one of them to a task-less
+// agent in the tools table is therefore a useless tool, not a crash.
 func buildDomainReg(as *db.AssetStore) map[string]actool.CoreTool {
 	if as == nil {
 		return nil

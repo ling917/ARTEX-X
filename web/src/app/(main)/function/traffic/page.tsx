@@ -5,19 +5,20 @@ import * as React from "react";
 import {
   ArrowDownWideNarrowIcon,
   ArrowUpNarrowWideIcon,
-  CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  CopyIcon,
+  EraserIcon,
+  FilterXIcon,
   ListChecksIcon,
   Loader2Icon,
   RadioTowerIcon,
   SearchIcon,
   Trash2Icon,
-  WrapTextIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { HttpCodeBlock } from "@/components/http-code-block";
+import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -36,12 +37,14 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { SortableHead } from "@/components/ui/sortable-head";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api } from "@/lib/api";
+import { useStoredSortPreference } from "@/lib/sort-preference";
 import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
-import { cn, copyText } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 
 function fmtTime(ts: string) {
   return new Date(ts).toLocaleString("zh-CN", {
@@ -55,7 +58,9 @@ function fmtTime(ts: string) {
 
 function fmtBytes(n: number) {
   if (n <= 0) return "0 B";
-  const units = ["B", "KB", "MB"];
+  // GB matters for the reclaimed-space figure a full purge reports; a capture-heavy
+  // instance can hand back several.
+  const units = ["B", "KB", "MB", "GB"];
   const i = Math.min(Math.floor(Math.log(n) / Math.log(1024)), units.length - 1);
   const v = n / 1024 ** i;
   return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
@@ -90,212 +95,25 @@ function requestWithHost(raw: string, exchange: TrafficExchange): string {
   return `${raw.slice(0, firstLineEnd + newline.length)}Host: ${host}${newline}${raw.slice(firstLineEnd + newline.length)}`;
 }
 
-function StartLine({ line }: { line: string }) {
-  const response = /^(HTTP\/\S+)(\s+)(\d{3})(.*)$/.exec(line);
-  if (response) {
-    return (
-      <>
-        <span className="text-muted-foreground">{response[1]}</span>
-        {response[2]}
-        <span className={statusTone(Number(response[3]))}>{response[3]}</span>
-        {response[4]}
-      </>
-    );
-  }
-
-  const request = /^([A-Z]+)(\s+)(\S+)(\s+)(HTTP\/\S+)$/.exec(line);
-  if (request) {
-    return (
-      <>
-        <span className="font-semibold text-primary">{request[1]}</span>
-        {request[2]}
-        <span className="text-chart-2">{request[3]}</span>
-        {request[4]}
-        <span className="text-muted-foreground">{request[5]}</span>
-      </>
-    );
-  }
-
-  return line;
-}
-
-function HeaderLine({ line }: { line: string }) {
-  const separator = line.indexOf(":");
-  if (separator <= 0) return line;
-  return (
-    <>
-      <span className="text-primary">{line.slice(0, separator)}</span>
-      <span className="text-muted-foreground">:</span>
-      <span className="text-chart-2">{line.slice(separator + 1)}</span>
-    </>
-  );
-}
-
-function JsonBody({ body }: { body: string }) {
-  const parts: React.ReactNode[] = [];
-  const tokens = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
-  let cursor = 0;
-  for (const match of body.matchAll(tokens)) {
-    const index = match.index ?? 0;
-    if (index > cursor) parts.push(body.slice(cursor, index));
-    let className = "text-chart-4";
-    if (match[1]) className = match[2] ? "text-primary" : "text-chart-2";
-    else if (match[3]) className = "text-chart-3";
-    parts.push(
-      <span key={`${index}-${match[0].length}`} className={className}>
-        {match[0]}
-      </span>,
-    );
-    cursor = index + match[0].length;
-  }
-  if (cursor < body.length) parts.push(body.slice(cursor));
-  return parts;
-}
-
-function MarkupBody({ body }: { body: string }) {
-  const parts: React.ReactNode[] = [];
-  const tags = /<\/?[A-Za-z][^>]*>|<!--[\s\S]*?-->/g;
-  let cursor = 0;
-  for (const match of body.matchAll(tags)) {
-    const index = match.index ?? 0;
-    if (index > cursor) parts.push(body.slice(cursor, index));
-    parts.push(
-      <span key={`${index}-${match[0].length}`} className="text-primary">
-        {match[0]}
-      </span>,
-    );
-    cursor = index + match[0].length;
-  }
-  if (cursor < body.length) parts.push(body.slice(cursor));
-  return parts;
-}
-
-type BodyFormat = "json" | "markup" | "plain";
-
-function detectBodyFormat(body: string): BodyFormat {
-  const trimmed = body.trimStart();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
-  if (trimmed.startsWith("<")) return "markup";
-  return "plain";
-}
-
-function HighlightedBody({ body, format }: { body: string; format: BodyFormat }) {
-  if (format === "json") return <JsonBody body={body} />;
-  if (format === "markup") return <MarkupBody body={body} />;
-  return body;
-}
-
-function HttpCodeBlock({ raw }: { raw: string }) {
-  const [wrapLines, setWrapLines] = React.useState(true);
-  const [copied, setCopied] = React.useState(false);
-  const value = raw || "（空）";
-  const lines = value.replaceAll("\r\n", "\n").split("\n");
-  const separator = lines.indexOf("");
-  const body = separator >= 0 ? lines.slice(separator + 1).join("\n") : "";
-  const bodyFormat = detectBodyFormat(body);
-
-  React.useEffect(() => {
-    if (!copied) return;
-    const timer = window.setTimeout(() => setCopied(false), 1500);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
-
-  const copyPacket = async () => {
-    const ok = await copyText(value);
-    if (ok) {
-      setCopied(true);
-      return;
-    }
-    toast.error("复制失败，请使用 Ctrl/Cmd+A 后复制");
-  };
-
-  const renderLine = (line: string, index: number) => {
-    if (index === 0) return <StartLine line={line} />;
-    if (separator < 0 || index < separator) return <HeaderLine line={line} />;
-    if (index === separator) return null;
-    return <HighlightedBody body={line} format={bodyFormat} />;
-  };
-
-  return (
-    <div className="relative mx-3 my-4 overflow-hidden rounded-md border bg-background shadow-xs">
-      <div className="absolute top-2 right-2 flex items-center gap-0.5 rounded-md border bg-background/95 p-0.5 shadow-xs">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={wrapLines ? "关闭自动换行" : "开启自动换行"}
-              aria-pressed={wrapLines}
-              onClick={() => setWrapLines((current) => !current)}
-            >
-              <WrapTextIcon />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{wrapLines ? "关闭自动换行" : "开启自动换行"}</TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={copied ? "已复制报文" : "复制报文"}
-              onClick={() => void copyPacket()}
-            >
-              {copied ? <CheckIcon /> : <CopyIcon />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{copied ? "已复制" : "复制报文"}</TooltipContent>
-        </Tooltip>
-      </div>
-      {/* biome-ignore lint/a11y/useSemanticElements: textarea cannot preserve line numbers and syntax-highlighting markup. */}
-      <div
-        role="textbox"
-        aria-label="HTTP 报文代码"
-        aria-multiline="true"
-        aria-readonly="true"
-        tabIndex={0}
-        className="max-h-[calc(100vh-15rem)] min-w-0 overflow-auto bg-background py-3 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        onKeyDown={(event) => {
-          if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "a") return;
-          event.preventDefault();
-          const selection = window.getSelection();
-          if (!selection) return;
-          const range = document.createRange();
-          range.selectNodeContents(event.currentTarget);
-          selection.removeAllRanges();
-          selection.addRange(range);
-        }}
-      >
-        {lines.map((line, index) => (
-          <div
-            key={`${index}-${line}`}
-            data-line={index + 1}
-            className="grid min-w-0 grid-cols-[1.5rem_minmax(0,1fr)] leading-relaxed before:sticky before:left-0 before:self-stretch before:border-r before:bg-muted/20 before:px-1 before:text-right before:text-muted-foreground/60 before:content-[attr(data-line)]"
-          >
-            <code
-              className={cn(
-                "min-h-[1lh] min-w-0 pr-16 pl-1.5 [tab-size:4]",
-                wrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
-              )}
-            >
-              {renderLine(line, index)}
-            </code>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 // Fixed method set (server filters exact-match); avoids deriving options from a
 // single page, which would only ever list the methods on that page.
 const METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 const PAGE_SIZES = [25, 50, 100, 200];
 type HostCountSortDirection = "asc" | "desc";
 
+// Server-sortable columns. The list is sent to the backend verbatim as `sort`,
+// which whitelists these same names, so keep them in sync with traffic.Page.
+const SORT_FIELDS = ["ts", "status", "resp_len"] as const;
+type SortField = (typeof SORT_FIELDS)[number];
+const SORT_STORAGE_KEY = "traffic-sort";
+
+// Status-class buckets for the filter dropdown; the value is sent as `status`,
+// which the backend reads as either an exact code or an "Nxx" class band.
+const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
+
 export default function TrafficPage() {
+  const [selectedFlows, setSelectedFlows] = React.useState<Set<string>>(() => new Set());
+  const [linking, setLinking] = React.useState(false);
   const [page, setPage] = React.useState(0);
   const [size, setSize] = React.useState(50);
   const [host, setHost] = React.useState(""); // raw host input
@@ -303,6 +121,20 @@ export default function TrafficPage() {
   const [query, setQuery] = React.useState(""); // raw free-text input
   const [queryQ, setQueryQ] = React.useState(""); // debounced → server
   const [method, setMethod] = React.useState("all");
+
+  // Advanced filters (issue #177): response-body content, path, status class and
+  // response-size range. Text inputs are debounced like host/query; the status
+  // select applies immediately.
+  const [body, setBody] = React.useState("");
+  const [bodyQ, setBodyQ] = React.useState("");
+  const [path, setPath] = React.useState("");
+  const [pathQ, setPathQ] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState("all");
+  const [respMin, setRespMin] = React.useState("");
+  const [respMinQ, setRespMinQ] = React.useState("");
+  const [respMax, setRespMax] = React.useState("");
+  const [respMaxQ, setRespMaxQ] = React.useState("");
+  const [sort, setSort] = useStoredSortPreference<SortField>(SORT_STORAGE_KEY, SORT_FIELDS, "ts", "desc");
 
   const [traffic, setTraffic] = React.useState<TrafficResp | null>(null);
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
@@ -314,7 +146,7 @@ export default function TrafficPage() {
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const [hostCountSortDirection, setHostCountSortDirection] = React.useState<HostCountSortDirection>("desc");
 
-  const [deleteMode, setDeleteMode] = React.useState<"filter" | "selected" | null>(null); // null = dialog closed
+  const [deleteMode, setDeleteMode] = React.useState<"filter" | "selected" | "all" | null>(null); // null = dialog closed
   const [deleting, setDeleting] = React.useState(false);
   const [reloadTick, setReloadTick] = React.useState(0); // manual refetch trigger
 
@@ -327,12 +159,41 @@ export default function TrafficPage() {
     const t = setTimeout(() => setQueryQ(query.trim()), 300);
     return () => clearTimeout(t);
   }, [query]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setBodyQ(body.trim()), 300);
+    return () => clearTimeout(t);
+  }, [body]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setPathQ(path.trim()), 300);
+    return () => clearTimeout(t);
+  }, [path]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setRespMinQ(respMin.trim()), 300);
+    return () => clearTimeout(t);
+  }, [respMin]);
+  React.useEffect(() => {
+    const t = setTimeout(() => setRespMaxQ(respMax.trim()), 300);
+    return () => clearTimeout(t);
+  }, [respMax]);
 
-  // Any filter/size change resets to the first page.
+  const hasAdvancedFilter = Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all";
+  const resetAdvancedFilters = () => {
+    setBody("");
+    setBodyQ("");
+    setPath("");
+    setPathQ("");
+    setStatusFilter("all");
+    setRespMin("");
+    setRespMinQ("");
+    setRespMax("");
+    setRespMaxQ("");
+  };
+
+  // Any filter/size/sort change resets to the first page.
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -341,7 +202,15 @@ export default function TrafficPage() {
     let alive = true;
     const load = () => {
       api
-        .traffic(page, size, hostQ, method, queryQ)
+        .traffic(page, size, hostQ, method, queryQ, {
+          body: bodyQ,
+          path: pathQ,
+          status: statusFilter,
+          respMin: respMinQ,
+          respMax: respMaxQ,
+          sort: sort.field,
+          order: sort.direction,
+        })
         .then((r) => {
           if (alive) setTraffic(r);
         })
@@ -366,7 +235,7 @@ export default function TrafficPage() {
       alive = false;
       clearInterval(t);
     };
-  }, [page, size, hostQ, method, queryQ, reloadTick]);
+  }, [page, size, hostQ, method, queryQ, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, reloadTick]);
 
   // Delete traffic for the current host filter (substring) or the checked
   // hosts (exact batch), then refetch.
@@ -380,22 +249,50 @@ export default function TrafficPage() {
     [hosts, hostCountSortDirection],
   );
 
+  // "清空" for the unfiltered purge, "删除" for the host-scoped ones — the dialog's
+  // title and its confirm button both follow from which is in play.
+  const deleteVerb = deleteMode === "all" ? "清空" : "删除";
+  const deleteTitle = deleteMode
+    ? {
+        all: "清空全部流量记录？",
+        selected: `删除选中的 ${selectedHosts.length} 个目标的全部流量？`,
+        filter: "删除该目标的全部流量？",
+      }[deleteMode]
+    : "";
+
+  // `reclaimed` only comes back from the full purge; the host-scoped deletions
+  // report the row count alone.
+  const requestDelete = (mode: "filter" | "selected" | "all"): Promise<{ deleted: number; reclaimed?: number }> => {
+    if (mode === "all") return api.trafficDeleteAll();
+    if (mode === "selected") return api.trafficDeleteHosts(selectedHosts);
+    return api.trafficDeleteHost(hostQ);
+  };
+
   const confirmDelete = () => {
+    if (!deleteMode) return;
     setDeleting(true);
-    const p = deleteMode === "selected" ? api.trafficDeleteHosts(selectedHosts) : api.trafficDeleteHost(hostQ);
-    p.then(() => {
-      setDeleteMode(null);
-      setSelected(null);
-      setDetail(null);
-      if (deleteMode === "selected") {
-        setSelectedHosts([]);
-        setPickerOpen(false);
-      }
-      setPage(0);
-      setReloadTick((t) => t + 1);
-    })
-      .catch(() => {
+    const mode = deleteMode;
+    requestDelete(mode)
+      .then((r) => {
+        setDeleteMode(null);
+        setSelected(null);
+        setDetail(null);
+        if (mode !== "filter") {
+          setSelectedHosts([]);
+          setPickerOpen(false);
+        }
+        if (mode === "all") {
+          // Reclaimed space is the whole point of compacting an emptied index, so say so.
+          const reclaimed = r.reclaimed ?? 0;
+          const freed = reclaimed > 0 ? `，释放 ${fmtBytes(reclaimed)} 存储` : "";
+          toast.success(`已清空 ${r.deleted} 条流量${freed}`);
+        }
+        setPage(0);
+        setReloadTick((t) => t + 1);
+      })
+      .catch((e) => {
         // Keep the confirmation open so the user can retry a failed deletion.
+        if (mode === "all") toast.error(`清空失败：${(e as Error).message}`);
       })
       .finally(() => setDeleting(false));
   };
@@ -424,6 +321,15 @@ export default function TrafficPage() {
       alive = false;
     };
   }, [selected]);
+
+  // Toggle direction when re-clicking the active column, else sort the new column
+  // newest/largest-first.
+  const toggleSort = (field: SortField) =>
+    setSort((prev) =>
+      prev.field === field
+        ? { field, direction: prev.direction === "asc" ? "desc" : "asc" }
+        : { field, direction: "desc" },
+    );
 
   const exchanges = React.useMemo(() => traffic?.exchanges ?? [], [traffic]);
   const total = traffic?.total ?? exchanges.length;
@@ -560,6 +466,19 @@ export default function TrafficPage() {
           <Trash2Icon className="size-3.5" />
           删除该目标
         </Button>
+        {/* Outline rather than a second destructive button: this one ignores every
+            filter, so it must not look one mis-click away from "删除该目标". */}
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
+          disabled={!traffic?.count || deleting}
+          title={traffic?.count ? "删除全部流量并压实存储" : "当前没有流量记录"}
+          onClick={() => setDeleteMode("all")}
+        >
+          <EraserIcon className="size-3.5" />
+          清空全部
+        </Button>
         <div className="relative max-w-sm flex-1">
           <SearchIcon className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -623,6 +542,77 @@ export default function TrafficPage() {
         </div>
       </div>
 
+      {/* Advanced filters (issue #177): narrow 660k+ exchanges down to the one packet. */}
+      <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 px-2 py-1.5">
+        <span className="pl-1 text-xs font-medium text-muted-foreground">高级筛选</span>
+        <div className="relative w-56">
+          <Input
+            placeholder="响应内容（正文关键词，≥3字）"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            className="h-8"
+          />
+        </div>
+        <div className="relative w-52">
+          <Input
+            placeholder="路径（如 /api/user/…）"
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            className="h-8"
+          />
+        </div>
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger size="sm" className="w-28">
+            <SelectValue placeholder="状态码" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">全部状态码</SelectItem>
+            {STATUS_BUCKETS.map((s) => (
+              <SelectItem key={s} value={s}>
+                {s}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="flex items-center gap-1 text-xs text-muted-foreground">
+          <span>响应长度</span>
+          <Input
+            type="number"
+            min={0}
+            placeholder="最小(B)"
+            value={respMin}
+            onChange={(e) => setRespMin(e.target.value)}
+            className="h-8 w-24"
+          />
+          <span>–</span>
+          <Input
+            type="number"
+            min={0}
+            placeholder="最大(B)"
+            value={respMax}
+            onChange={(e) => setRespMax(e.target.value)}
+            className="h-8 w-24"
+          />
+        </div>
+        {hasAdvancedFilter ? (
+          <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
+            <FilterXIcon className="size-3.5" />
+            清除筛选
+          </Button>
+        ) : null}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm text-muted-foreground">已选 {selectedFlows.size} 条流量</span>
+        <Button variant="outline" size="sm" disabled={selectedFlows.size === 0} onClick={() => setLinking(true)}>
+          关联到漏洞
+        </Button>
+        {selectedFlows.size > 0 ? (
+          <Button variant="ghost" size="sm" onClick={() => setSelectedFlows(new Set())}>
+            清空选择
+          </Button>
+        ) : null}
+      </div>
       {/* History table */}
       <div className="flex h-[calc(100vh-15rem)] min-h-0 flex-col">
         <Card className="flex min-h-0 flex-1 flex-col overflow-hidden py-0">
@@ -630,13 +620,51 @@ export default function TrafficPage() {
             <Table>
               <TableHeader className="sticky top-0 z-10 bg-card">
                 <TableRow>
-                  <TableHead className="w-36">时间</TableHead>
+                  <TableHead className="w-10">
+                    <Checkbox
+                      aria-label="选择本页流量"
+                      checked={exchanges.length > 0 && exchanges.every((e) => selectedFlows.has(e.id))}
+                      onCheckedChange={(checked) =>
+                        setSelectedFlows((previous) => {
+                          const next = new Set(previous);
+                          for (const e of exchanges) {
+                            if (checked === true) next.add(e.id);
+                            else next.delete(e.id);
+                          }
+                          return next;
+                        })
+                      }
+                    />
+                  </TableHead>
+                  <SortableHead
+                    field="ts"
+                    label="时间"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    className="w-36"
+                  />
                   <TableHead className="w-44">host</TableHead>
                   <TableHead className="w-20">方法</TableHead>
                   <TableHead>URL</TableHead>
-                  <TableHead className="w-20">状态码</TableHead>
+                  <SortableHead
+                    field="status"
+                    label="状态码"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    className="w-20"
+                  />
                   <TableHead className="w-36">content-type</TableHead>
-                  <TableHead className="w-24 text-right">响应长度</TableHead>
+                  <SortableHead
+                    field="resp_len"
+                    label="响应长度"
+                    activeField={sort.field}
+                    direction={sort.direction}
+                    onSort={toggleSort}
+                    align="right"
+                    className="w-24 text-right"
+                  />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -646,6 +674,21 @@ export default function TrafficPage() {
                     className={cn("cursor-pointer", selected?.id === e.id && "bg-accent hover:bg-accent")}
                     onClick={() => setSelected(e)}
                   >
+                    <TableCell>
+                      <Checkbox
+                        aria-label={`选择流量 ${e.id}`}
+                        checked={selectedFlows.has(e.id)}
+                        onClick={(event) => event.stopPropagation()}
+                        onCheckedChange={(checked) =>
+                          setSelectedFlows((previous) => {
+                            const next = new Set(previous);
+                            if (checked === true) next.add(e.id);
+                            else next.delete(e.id);
+                            return next;
+                          })
+                        }
+                      />
+                    </TableCell>
                     <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(e.ts)}</TableCell>
                     <TableCell className="font-mono text-xs">{e.host}</TableCell>
                     <TableCell>
@@ -665,7 +708,7 @@ export default function TrafficPage() {
                 ))}
                 {exchanges.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={7} className="py-12 text-center text-sm text-muted-foreground">
+                    <TableCell colSpan={8} className="py-12 text-center text-sm text-muted-foreground">
                       {traffic === null ? "加载中…" : "没有匹配的流量。"}
                     </TableCell>
                   </TableRow>
@@ -676,6 +719,13 @@ export default function TrafficPage() {
         </Card>
       </div>
 
+      {linking ? (
+        <LinkTrafficDialog
+          trafficIds={[...selectedFlows]}
+          onClose={() => setLinking(false)}
+          onBound={() => setSelectedFlows(new Set())}
+        />
+      ) : null}
       <Sheet open={selected !== null} onOpenChange={(open) => !open && setSelected(null)}>
         <SheetContent className="w-full! max-w-none! gap-0 p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
           {selected && (
@@ -730,13 +780,19 @@ export default function TrafficPage() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              {deleteMode === "selected"
-                ? `删除选中的 ${selectedHosts.length} 个目标的全部流量？`
-                : "删除该目标的全部流量？"}
-            </AlertDialogTitle>
+            <AlertDialogTitle>{deleteTitle}</AlertDialogTitle>
             <AlertDialogDescription>
-              {deleteMode === "selected" ? (
+              {deleteMode === "all" && (
+                <>
+                  将永久删除全部 <span className="font-semibold tabular-nums">{traffic?.count ?? 0}</span>{" "}
+                  条流量记录（含请求/响应原文），忽略当前的筛选条件，此操作不可撤销。已绑定到漏洞的流量证据保存在独立的证据库中，不受影响。
+                  <br />
+                  <span className="text-muted-foreground">
+                    清空后会顺带压实存储，把索引占用的磁盘空间还给系统；这期间流量录制会短暂暂停。
+                  </span>
+                </>
+              )}
+              {deleteMode === "selected" && (
                 <>
                   将永久删除 <span className="font-semibold tabular-nums">{selectedHosts.length}</span> 个目标（
                   <span className="font-mono">
@@ -745,7 +801,8 @@ export default function TrafficPage() {
                   </span>
                   ）的所有流量记录（含请求/响应原文），此操作不可撤销。
                 </>
-              ) : (
+              )}
+              {deleteMode === "filter" && (
                 <>
                   将永久删除 host 包含 <span className="font-mono font-semibold">{hostQ}</span>{" "}
                   的所有流量记录（含请求/响应原文），此操作不可撤销。
@@ -763,7 +820,7 @@ export default function TrafficPage() {
               disabled={deleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {deleting ? "删除中…" : "确认删除"}
+              {deleting ? `${deleteVerb}中…` : `确认${deleteVerb}`}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

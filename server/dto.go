@@ -30,36 +30,45 @@ func rawString(raw json.RawMessage) string {
 
 // ---- Task (frontend "Task") ---- created_at as RFC3339, plus a derived status.
 type TaskDTO struct {
-	ID                 string        `json:"id"`
-	ExplorationID      int64         `json:"exploration_id"`
-	Name               string        `json:"name"` // 可选任务名称;空=未命名
-	CategoryID         *int64        `json:"category_id,omitempty"`
-	CategoryName       string        `json:"category_name,omitempty"`
-	Pinned             bool          `json:"pinned"`
-	PinnedAt           string        `json:"pinned_at,omitempty"`
-	Description        string        `json:"description"`
-	Goal               string        `json:"goal"`
-	Status             string        `json:"status"` // created | running | paused | done | failed
-	CreatedAt          string        `json:"created_at"`
-	CreatedUnix        int64         `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
-	CompletedAt        string        `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
-	CompletedUnix      int64         `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
-	LastActivity       int64         `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
-	Paused             bool          `json:"paused"`
-	Queued             bool          `json:"queued"`
-	Tokens             TokenTotalDTO `json:"tokens"` // whole-task token consumption
-	GoalsTotal         int           `json:"goals_total"`
-	GoalsMet           int           `json:"goals_met"`
-	InFlight           int           `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
-	LLMProfileID       *int64        `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
-	LLMProfileIDs      []int64       `json:"llm_profile_ids"`
-	ActiveLLMProfileID *int64        `json:"active_llm_profile_id,omitempty"`
-	LLMFailoverState   string        `json:"llm_failover_state"`
-	LLMFailoverReason  string        `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []string      `json:"source_task_ids"`
-	ArchiveBlockedBy   string        `json:"archive_blocked_by_task_id,omitempty"`
-	CompanyIDs         []int64       `json:"company_ids"`
-	CoverageEnabled    bool          `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+	ID                 string             `json:"id"`
+	ExplorationID      int64              `json:"exploration_id"`
+	Name               string             `json:"name"` // 可选任务名称;空=未命名
+	CategoryID         *int64             `json:"category_id,omitempty"`
+	CategoryName       string             `json:"category_name,omitempty"`
+	Pinned             bool               `json:"pinned"`
+	PinnedAt           string             `json:"pinned_at,omitempty"`
+	Description        string             `json:"description"`
+	Goal               string             `json:"goal"`
+	Status             string             `json:"status"` // created | running | paused | done | failed
+	CreatedAt          string             `json:"created_at"`
+	CreatedUnix        int64              `json:"created_unix"`       // created_at as unix seconds (for run-duration calc)
+	CompletedAt        string             `json:"completed_at"`       // RFC3339 finish time (done/failed); "" if unfinished
+	CompletedUnix      int64              `json:"completed_unix"`     // completed_at as unix seconds (0 if unfinished)
+	LastActivity       int64              `json:"last_activity_unix"` // unix seconds of the last activity (0 if none)
+	Paused             bool               `json:"paused"`
+	Queued             bool               `json:"queued"`
+	Tokens             TokenTotalDTO      `json:"tokens"` // whole-task token consumption
+	GoalsTotal         int                `json:"goals_total"`
+	GoalsMet           int                `json:"goals_met"`
+	InFlight           int                `json:"in_flight"`                // 运行中 Worker 数（state=running 的意图）
+	Findings           FindingSeverityDTO `json:"findings"`                 // 该任务已登记的漏洞数（findings 表，按严重度分档）
+	LLMProfileID       *int64             `json:"llm_profile_id,omitempty"` // LLM profile used for this task; nil = default
+	LLMProfileIDs      []int64            `json:"llm_profile_ids"`
+	ActiveLLMProfileID *int64             `json:"active_llm_profile_id,omitempty"`
+	LLMFailoverState   string             `json:"llm_failover_state"`
+	LLMFailoverReason  string             `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs      []string           `json:"source_task_ids"`
+	ArchiveBlockedBy   string             `json:"archive_blocked_by_task_id,omitempty"`
+	CompanyIDs         []int64            `json:"company_ids"`
+	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
+}
+
+// FindingSeverityDTO 是任务列表里按严重度分档的漏洞计数（严重/高/中/低）。
+type FindingSeverityDTO struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
 }
 
 func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
@@ -177,17 +186,19 @@ type TaskNodeDTO struct {
 	TS           string `json:"ts"`
 	SourceTaskID string `json:"source_task_id,omitempty"`
 	Inherited    bool   `json:"inherited,omitempty"`
+	DeleteReason string `json:"delete_reason,omitempty"` // 意图假删除(state='deleted')时的删除原因
 }
 
 func taskNodeDTO(n *db.Node) TaskNodeDTO {
 	d := TaskNodeDTO{
-		ID:       i64s(n.ID),
-		Type:     n.Kind,
-		Payload:  rawString(n.Payload),
-		Priority: n.Priority,
-		State:    n.State,
-		Origin:   n.Origin,
-		TS:       rfc3339(n.CreatedAt),
+		ID:           i64s(n.ID),
+		Type:         n.Kind,
+		Payload:      rawString(n.Payload),
+		DeleteReason: n.DeleteReason,
+		Priority:     n.Priority,
+		State:        n.State,
+		Origin:       n.Origin,
+		TS:           rfc3339(n.CreatedAt),
 	}
 	if n.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(n.SourceTaskID)
@@ -292,12 +303,18 @@ func coverageAssetRefDTO(ref db.AssetRef) CoverageAssetRefDTO {
 // ---- Finding (frontend "Finding") ----
 
 type FindingDTO struct {
+	TrafficCount          int                        `json:"traffic_count"`
+	EvidenceVersion       int64                      `json:"evidence_version"`
+	ReportEvidenceVersion int64                      `json:"report_evidence_version"`
+	ReportStale           bool                       `json:"report_stale"`
+	TrafficBindings       []db.FindingTrafficBinding `json:"traffic_bindings,omitempty"`
+
 	ID        string `json:"id"`
 	FindingID string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
 	VulnClass string `json:"vulnclass"`
 	Name      string `json:"name,omitempty"` // 漏洞名称;为空时前端回退展示 vulnclass
 	Severity  string `json:"severity"`       // critical | high | medium | low
-	Status    string `json:"status"`         // pending | in_progress | confirmed | resolved | false_positive | ignored | duplicate | risk_accepted
+	Status    string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
 	Summary   string `json:"summary"`
 	Evidence  string `json:"evidence"`
 	Report    string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
@@ -399,6 +416,7 @@ func findingDTOsForOwner(taskID, description string, in []*db.Node, meta map[int
 		if m, ok := meta[n.ID]; ok {
 			d.FindingID = i64s(m.ID)
 			d.Status = m.Status
+			d.TrafficCount = m.TrafficCount
 			d.Assets = findingAssetDTOs(m.AssetIDs, assets)
 		}
 		out = append(out, d)
@@ -426,8 +444,10 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		status = db.FindingPending
 	}
 	d := FindingDTO{
-		ID:        i64s(f.ID),
-		FindingID: i64s(f.ID),
+		ID:           i64s(f.ID),
+		FindingID:    i64s(f.ID),
+		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
+		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
 		VulnClass: f.VulnClass,
 		Name:      f.Name,
 		Severity:  f.Severity,
@@ -464,6 +484,7 @@ type ActivityDTO struct {
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	SourceTaskID string          `json:"source_task_id,omitempty"`
 	Inherited    bool            `json:"inherited,omitempty"`
+	MainSeg      *int            `json:"main_seg,omitempty"` // main-agent conversation segment (nil for non-mainagent rows)
 	// token usage (set only on kind='result'); used for per-session token totals.
 	InputTokens      *int `json:"input_tokens,omitempty"`
 	OutputTokens     *int `json:"output_tokens,omitempty"`
@@ -492,6 +513,7 @@ func activityDTO(a db.Activity) ActivityDTO {
 		OutputTokens:     a.OutputTokens,
 		CacheReadTokens:  a.CacheReadTokens,
 		CacheWriteTokens: a.CacheWriteTokens,
+		MainSeg:          a.MainSeg,
 	}
 	if a.SourceTaskID > 0 {
 		d.SourceTaskID = i64s(a.SourceTaskID)
@@ -591,6 +613,10 @@ type LLMProfileDTO struct {
 	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
 	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
 	SessionHeaderKey string `json:"session_header_key"`
+	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
+	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
+	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
+	Retry db.RetryOverride `json:"retry"`
 }
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
@@ -614,6 +640,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		Retry:            p.Retry,
 	}
 }
 

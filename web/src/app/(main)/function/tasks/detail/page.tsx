@@ -40,19 +40,23 @@ import { api } from "@/lib/api";
 import type { LLMProfile, Task } from "@/lib/types";
 
 import { AssetsTab } from "./_tabs/assets-tab";
+import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
+import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
 
 const TABS = [
   { value: "sessions", label: "会话" },
   { value: "overview", label: "总览" },
   { value: "graph", label: "探索链路" },
+  { value: "broadcast", label: "播报板" },
   { value: "findings", label: "发现" },
+  { value: "retests", label: "复测" },
   { value: "assets", label: "测试资产" },
   { value: "coverage", label: "资产覆盖图" },
   { value: "intercept", label: "拦截审批" },
@@ -299,7 +303,7 @@ function TaskDetailInner() {
   if (!task) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 p-10 text-center">
-        <p className="text-muted-foreground">{loaded ? `未找到任务 ${id}` : "加载中…"}</p>
+        <p className="text-muted-foreground">{loaded ? `任务 ${id} 已被删除、归档或不存在` : "加载中…"}</p>
         {loaded && (
           <Button asChild variant="outline">
             <Link href="/function/tasks">
@@ -422,8 +426,14 @@ function TaskDetailInner() {
         <TabsContent value="graph" className="mt-0">
           <GraphTab taskId={id} />
         </TabsContent>
+        <TabsContent value="broadcast" className="mt-0">
+          <BroadcastTab taskId={id} />
+        </TabsContent>
         <TabsContent value="findings" className="mt-0">
           <FindingsTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="retests" className="mt-0">
+          <RetestsTab key={id} taskId={id} />
         </TabsContent>
         <TabsContent value="assets" className="mt-0">
           <AssetsTab taskId={id} />
